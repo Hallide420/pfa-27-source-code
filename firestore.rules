@@ -82,5 +82,35 @@ service cloud.firestore {
       // Disallow client deletion
       allow delete: if false;
     }
+
+    function isValidAnnouncement(data) {
+      return data.keys().hasAll([
+        'title', 'content', 'category', 'pinned', 'authorName', 'authorUid', 'createdAt'
+      ]) &&
+      data.title is string && data.title.size() > 0 && data.title.size() <= 140 &&
+      data.content is string && data.content.size() > 0 && data.content.size() <= 3000 &&
+      data.category is string && data.category in ['PATCH_NOTES', 'TOURNAMENT', 'FEATURE', 'ANNOUNCEMENT'] &&
+      data.pinned is bool &&
+      data.authorName is string && data.authorName.size() > 0 && data.authorName.size() <= 64 &&
+      data.authorUid is string && data.authorUid == request.auth.uid && data.authorUid.size() <= 128 &&
+      data.createdAt is timestamp;
+    }
+
+    // Official Developer News & Announcements
+    match /announcements/{announcementId} {
+      // All signed-in players can read announcements
+      allow read: if isSignedIn();
+
+      // Only verified Admin can create, update, or delete announcements
+      allow create: if isAdmin() &&
+        isValidAnnouncement(incoming()) &&
+        incoming().createdAt == request.time;
+
+      allow update: if isAdmin() &&
+        isValidAnnouncement(incoming()) &&
+        incoming().createdAt == existing().createdAt;
+
+      allow delete: if isAdmin();
+    }
   }
 }

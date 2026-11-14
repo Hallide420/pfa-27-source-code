@@ -63,6 +63,7 @@ const DEFAULT_STARTER_PROFILE: PlayerProfile = {
   isAdmin: false,
   platform: detectDevicePlatform(),
   crossplaySetting: 'CROSSPLAY_ENABLED',
+  tutorialCompleted: false,
 };
 
 const getLocalProfile = (uid: string): PlayerProfile | null => {
@@ -104,6 +105,7 @@ const getAdminProfile = (): PlayerProfile => ({
   isAdmin: true,
   platform: detectDevicePlatform(),
   crossplaySetting: 'CROSSPLAY_ENABLED',
+  tutorialCompleted: true,
 });
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -174,6 +176,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           isAdmin: isAdmin,
           platform: data.platform || detectDevicePlatform(),
           crossplaySetting: data.crossplaySetting || 'CROSSPLAY_ENABLED',
+          tutorialCompleted: Boolean(data.tutorialCompleted ?? (isAdmin ? true : false)),
         };
 
         setProfile(loadedProfile);
@@ -337,6 +340,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           isAdmin: Boolean(newProfile.isAdmin),
           platform: newProfile.platform,
           crossplaySetting: newProfile.crossplaySetting,
+          tutorialCompleted: Boolean(newProfile.tutorialCompleted),
           updatedAt: serverTimestamp(),
         },
         { merge: true }

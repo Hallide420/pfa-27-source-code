@@ -43,6 +43,8 @@ export const Navbar: React.FC<NavbarProps> = ({
 }) => {
   const navItems: { view: GameView; label: string }[] = [
     { view: 'HUB', label: 'Match Center' },
+    { view: 'TUTORIAL', label: 'Academy' },
+    { view: 'NEWS', label: 'News' },
     { view: 'TOURNAMENT', label: 'Tournaments' },
     { view: 'GEOMETRY_STORE', label: 'Geometry Vault' },
     { view: 'LOCKER', label: 'Pen Armory' },

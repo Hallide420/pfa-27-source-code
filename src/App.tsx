@@ -20,6 +20,8 @@ import { PenLocker } from './components/PenLocker';
 import { MultiplayerLobby } from './components/MultiplayerLobby';
 import { AdminPanelModal } from './components/AdminPanelModal';
 import { BotLabModal } from './components/BotLabModal';
+import { TutorialAcademy } from './components/TutorialAcademy';
+import { NewsView } from './components/NewsView';
 import { detectDevicePlatform } from './utils/device';
 
 function MainAppContent() {
@@ -255,6 +257,19 @@ function MainAppContent() {
     }));
   };
 
+  const handleCompleteTutorial = () => {
+    updateProfileData((prev) => ({
+      ...prev,
+      tutorialCompleted: true,
+      paperclips: prev.paperclips + 100,
+      unlockedSkins: prev.unlockedSkins.includes('skin_gold_leaf')
+        ? prev.unlockedSkins
+        : [...prev.unlockedSkins, 'skin_gold_leaf'],
+    }));
+    sounds.levelUp();
+    setCurrentView('HUB');
+  };
+
   // Loading state
   if (loading) {
     return (
@@ -379,6 +394,22 @@ function MainAppContent() {
             crossplaySetting={crossplaySetting}
             onToggleCrossplay={handleToggleCrossplay}
             platform={currentPlatform}
+          />
+        )}
+
+        {currentView === 'TUTORIAL' && (
+          <TutorialAcademy
+            profile={profile}
+            onCompleteTutorial={handleCompleteTutorial}
+            onExit={() => setCurrentView('HUB')}
+          />
+        )}
+
+        {currentView === 'NEWS' && (
+          <NewsView
+            isAdminUser={isAdminUser || profile.isAdmin || profile.role === 'ADMIN'}
+            userEmail={user.email || undefined}
+            onNavigate={(view) => setCurrentView(view)}
           />
         )}
       </main>

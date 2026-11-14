@@ -120,6 +120,56 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "Announcement": {
+      "title": "Announcement",
+      "description": "Official PFA 27 developer news, patch notes, and tournament announcements",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Headline of the news post",
+          "maxLength": 140
+        },
+        "content": {
+          "type": "string",
+          "description": "Full announcement body text",
+          "maxLength": 3000
+        },
+        "category": {
+          "type": "string",
+          "enum": ["PATCH_NOTES", "TOURNAMENT", "FEATURE", "ANNOUNCEMENT"],
+          "description": "Category tag for the news post"
+        },
+        "pinned": {
+          "type": "boolean",
+          "description": "Whether the post is pinned to the top of the news feed"
+        },
+        "authorName": {
+          "type": "string",
+          "description": "Display name of the admin author",
+          "maxLength": 64
+        },
+        "authorUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the admin author",
+          "maxLength": 128
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when the announcement was published"
+        }
+      },
+      "required": [
+        "title",
+        "content",
+        "category",
+        "pinned",
+        "authorName",
+        "authorUid",
+        "createdAt"
+      ]
     }
   },
   "firestore": {
@@ -128,6 +178,12 @@
         "$ref": "#/entities/User"
       },
       "description": "Stores individual player account profile, paperclip wallet, and pen collection"
+    },
+    "/announcements/{announcementId}": {
+      "schema": {
+        "$ref": "#/entities/Announcement"
+      },
+      "description": "Stores official developer news and announcements"
     }
   }
 }

@@ -280,6 +280,73 @@ class SoundEngine {
       });
     } catch {}
   }
+
+  // Alias helpers for UI and tutorial
+  public flick(powerNormalized: number = 0.5) {
+    this.playFlick(powerNormalized);
+  }
+
+  public win() {
+    this.playPaperclipReward();
+  }
+
+  public levelUp() {
+    this.playPackOpening('Legendary');
+  }
+
+  public playClack(intensity: number = 0.6) {
+    this.playDeskImpact(intensity, 'plastic');
+  }
+
+  public playAimPull(powerFraction: number = 0.5) {
+    if (this.isMuted) return;
+    this.initContext();
+    if (!this.ctx) return;
+    try {
+      const now = this.ctx.currentTime;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(120 + powerFraction * 180, now);
+      osc.frequency.linearRampToValueAtTime(140 + powerFraction * 240, now + 0.05);
+
+      gain.gain.setValueAtTime(0.04, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.05);
+    } catch {}
+  }
+
+  public playPackTear() {
+    if (this.isMuted) return;
+    this.initContext();
+    if (!this.ctx) return;
+    try {
+      const now = this.ctx.currentTime;
+      const bufferSize = this.ctx.sampleRate * 0.12;
+      const buffer = this.ctx.createBuffer(1, bufferSize, this.ctx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) {
+        data[i] = (Math.random() * 2 - 1) * Math.exp(-i / (bufferSize * 0.4));
+      }
+      const noise = this.ctx.createBufferSource();
+      noise.buffer = buffer;
+      const gain = this.ctx.createGain();
+      gain.gain.setValueAtTime(0.2, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.12);
+      noise.connect(gain);
+      gain.connect(this.ctx.destination);
+      noise.start(now);
+      noise.stop(now + 0.12);
+    } catch {}
+  }
+
+  public playPackWalkout() {
+    this.playPackOpening('Legendary');
+  }
 }
 
 export const sounds = new SoundEngine();

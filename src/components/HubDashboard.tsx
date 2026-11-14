@@ -7,7 +7,7 @@ import React from 'react';
 import { GameView, PlayerProfile } from '../types/game';
 import { PENS_CATALOG, FLICK_STYLES } from '../data/initialData';
 import { sounds } from '../utils/audio';
-import { Play, Trophy, Package, Users, ArrowRight, Zap, Flame, Scale, Layers, Bot, Cpu } from 'lucide-react';
+import { Play, Trophy, Package, Users, ArrowRight, Zap, Flame, Scale, Layers, Bot, Cpu, BookOpen, Megaphone, CheckCircle2 } from 'lucide-react';
 
 interface HubDashboardProps {
   profile: PlayerProfile;
@@ -114,6 +114,70 @@ export const HubDashboard: React.FC<HubDashboardProps> = ({
                 <div className="text-[11px] font-sans text-slate-400 mt-1">
                   Style: <strong className="text-white">{equippedStyle.name}</strong> · Skin: {equippedSkin.name}
                 </div>
+              </div>
+              {/* Academy Boot Camp Banner */}
+              <div 
+                onClick={() => {
+                  sounds.playClick();
+                  onNavigate('TUTORIAL');
+                }}
+                className={`p-3.5 mb-4 border-2 transition-all cursor-pointer group flex items-center justify-between gap-3 ${
+                  profile.tutorialCompleted 
+                    ? 'bg-[#0d1520] border-emerald-500/40 hover:border-emerald-400' 
+                    : 'bg-[#181508] border-[#ffe500] shadow-[0_0_15px_rgba(255,229,0,0.2)] hover:bg-[#221c0b]'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <div className={`w-8 h-8 rounded-lg flex items-center justify-center font-black ${
+                    profile.tutorialCompleted ? 'bg-emerald-500 text-black' : 'bg-[#ffe500] text-black animate-pulse'
+                  }`}>
+                    {profile.tutorialCompleted ? <CheckCircle2 className="w-4 h-4" /> : <BookOpen className="w-4 h-4" />}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-broadcast text-xs uppercase tracking-wider font-bold text-white group-hover:text-[#ffe500] transition-colors">
+                        PFA 27 Training Academy
+                      </span>
+                      {profile.tutorialCompleted ? (
+                        <span className="text-[9px] font-mono font-bold uppercase bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 px-1.5 py-0.2">
+                          GRADUATED
+                        </span>
+                      ) : (
+                        <span className="text-[9px] font-mono font-bold uppercase bg-[#ffe500] text-black px-1.5 py-0.2">
+                          CLAIM +100 CLIPS
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-400 font-sans mt-0.5">
+                      {profile.tutorialCompleted 
+                        ? 'Mastered rigid body physics & gyro flicking. Replay lessons anytime.' 
+                        : 'Interactive 5-stage boot camp: direct aiming, mass ratios, and desk rim edge-braking.'}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-1 text-xs font-mono font-bold text-[#ffe500] group-hover:translate-x-1 transition-transform shrink-0">
+                  <span className="hidden sm:inline">{profile.tutorialCompleted ? 'REVIEW' : 'START'}</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </div>
+              </div>
+
+              {/* News Bulletin Quick Ribbon */}
+              <div
+                onClick={() => {
+                  sounds.playClick();
+                  onNavigate('NEWS');
+                }}
+                className="mb-4 px-3 py-2 bg-black/60 border border-slate-700/80 hover:border-slate-500 transition-all cursor-pointer flex items-center justify-between text-xs"
+              >
+                <div className="flex items-center gap-2 truncate">
+                  <Megaphone className="w-3.5 h-3.5 text-[#ffe500] shrink-0" />
+                  <span className="text-slate-300 font-sans truncate">
+                    <strong className="text-[#ffe500]">LATEST BULLETIN:</strong> Academy Live &amp; AI Bots isolated to Bot Lab.
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono font-bold text-[#ffe500] uppercase tracking-wider hover:underline shrink-0 ml-2">
+                  READ NEWS →
+                </span>
               </div>
             </div>
 

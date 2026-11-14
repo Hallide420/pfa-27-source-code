@@ -169,10 +169,32 @@ export interface PlayerProfile {
   isAdmin?: boolean;
   platform?: DevicePlatform;
   crossplaySetting?: CrossplaySetting;
+  tutorialCompleted?: boolean;
 }
 
 export type BotDifficulty = 'DUMMY' | 'ROOKIE' | 'NORMAL' | 'HARD' | 'CYBORG_APEX';
 
-export type MatchMode = 'RANKED' | 'TOURNAMENT' | 'PASS_PLAY' | 'ONLINE_ROOM' | 'BOT_BATTLE';
+export type MatchMode = 'RANKED' | 'TOURNAMENT' | 'PASS_PLAY' | 'ONLINE_ROOM' | 'BOT_BATTLE' | 'TUTORIAL';
 
-export type GameView = 'HUB' | 'MATCH' | 'TOURNAMENT' | 'GEOMETRY_STORE' | 'LOCKER' | 'MULTIPLAYER' | 'DIVISIONS' | 'BOT_LAB';
+export type GameView = 'HUB' | 'MATCH' | 'TOURNAMENT' | 'GEOMETRY_STORE' | 'LOCKER' | 'MULTIPLAYER' | 'DIVISIONS' | 'BOT_LAB' | 'TUTORIAL' | 'NEWS';
+
+export interface Announcement {
+  id: string;
+  title: string;
+  content: string;
+  category: 'PATCH_NOTES' | 'TOURNAMENT' | 'FEATURE' | 'ANNOUNCEMENT';
+  pinned: boolean;
+  authorName: string;
+  authorUid: string;
+  createdAt: any;
+}
+
+export interface TutorialLesson {
+  id: number;
+  stageName: string;
+  title: string;
+  mechanic: 'AIMING' | 'MASS_PHYSICS' | 'POWER_CONTROL' | 'SPIN_CURVE' | 'PROGRESSION_UNBOXING';
+  briefing: string;
+  coachingTip: string;
+  targetTask: string;
+}
