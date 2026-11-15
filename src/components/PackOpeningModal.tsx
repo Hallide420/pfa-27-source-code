@@ -84,15 +84,6 @@ export const PackOpeningModal: React.FC<PackOpeningModalProps> = ({
                 src={box.imagePath}
                 alt={box.name}
                 referrerPolicy="no-referrer"
-                onError={(e) => {
-                  const target = e.currentTarget;
-                  const fname = box.imagePath.split('/').pop() || '';
-                  if (!target.src.includes('/images/' + fname)) {
-                    target.src = `/images/${fname}`;
-                  } else if (!target.src.includes('/src/assets/images/' + fname)) {
-                    target.src = `/src/assets/images/${fname}`;
-                  }
-                }}
                 className="w-full h-full object-cover"
               />
               <div className="absolute bottom-0 left-0 right-0 bg-black/80 text-[#ffe500] font-mono text-[10px] font-black uppercase py-1 border-t-2 border-black">

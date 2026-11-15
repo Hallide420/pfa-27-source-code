@@ -863,34 +863,10 @@ export const DIVISIONS = [
   { division: 1, name: 'Division 1 - PFA World Elite', minRating: 2200, rewardBadge: '👑' },
 ];
 
-export const ADMIN_EMAIL = 'samwdoesthings@gmail.com';
-
 export const ALL_PEN_IDS = PENS_CATALOG.map((p) => p.id);
 export const ALL_SKIN_IDS = PENS_CATALOG.flatMap((p) => p.availableSkins.map((s) => s.id));
 export const ALL_FLICK_STYLE_IDS = FLICK_STYLES.map((s) => s.id);
 
-export const ADMIN_MASTER_PROFILE: PlayerProfile = {
-  username: 'Admin Developer (Sam)',
-  level: 99,
-  xp: 999999,
-  xpNextLevel: 1000000,
-  paperclips: 999999,
-  division: 1,
-  divisionPoints: 100,
-  totalWins: 777,
-  totalMatches: 777,
-  winStreak: 777,
-  equippedPenId: 'rotring_600',
-  equippedSkinId: 'skin_rotring_gold',
-  equippedFlickStyleId: 'style_knuckle_cannon',
-  unlockedPens: ALL_PEN_IDS,
-  unlockedSkins: ALL_SKIN_IDS,
-  unlockedFlickStyles: ALL_FLICK_STYLE_IDS,
-  role: 'ADMIN',
-  isAdmin: true,
-  platform: 'desktop',
-  crossplaySetting: 'CROSSPLAY_ENABLED',
-};
 
 export interface BotDifficultyConfig {
   id: 'DUMMY' | 'ROOKIE' | 'NORMAL' | 'HARD' | 'CYBORG_APEX';

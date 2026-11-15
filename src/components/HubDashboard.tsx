@@ -61,12 +61,6 @@ export const HubDashboard: React.FC<HubDashboardProps> = ({
               src="/images/pfa27_cover_hero.jpg"
               alt="PFA 27 Match Key Art"
               referrerPolicy="no-referrer"
-              onError={(e) => {
-                const target = e.currentTarget;
-                if (!target.src.includes('pfa27_cover_hero_1793632077705.jpg')) {
-                  target.src = '/src/assets/images/pfa27_cover_hero_1793632077705.jpg';
-                }
-              }}
               className="w-full h-full object-cover object-center filter contrast-125 brightness-95"
             />
             <div className="absolute inset-0 bg-gradient-to-t from-black via-transparent to-transparent opacity-80" />

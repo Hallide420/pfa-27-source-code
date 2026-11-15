@@ -26,14 +26,12 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
-    // Hardened Admin Verification: verified email token + exact bootstrapped admin email
+    // Strict Custom Claim Admin Check (minted server-side via Firebase Admin SDK)
     function isAdmin() {
-      return isVerifiedUser() &&
-        request.auth.token.email != null &&
-        request.auth.token.email.lower() == 'samwdoesthings@gmail.com';
+      return isSignedIn() && request.auth.token.admin == true;
     }
 
-    function isValidUser(data) {
+    function isValidUserSchema(data) {
       return data.keys().hasAll([
         'userId', 'username', 'email', 'level', 'xp', 'xpNextLevel',
         'paperclips', 'division', 'divisionPoints', 'totalWins', 'totalMatches',
@@ -99,128 +97,54 @@ service cloud.firestore {
         data.tutorialCompleted == false;
     }
 
-    function prevPaperclips() {
-      return 'paperclips' in existing() ? existing().paperclips : 240;
+    // Cosmetic preferences ONLY for client updates.
+    // All balances, xp, level, division, wins, unlocks, and admin flags are immutable to clients
+    // and can ONLY be modified server-side via Firebase Admin SDK.
+    function isCosmeticPrefsOnlyUpdate() {
+      return incoming().diff(existing()).affectedKeys().hasOnly([
+        'username',
+        'equippedPenId',
+        'equippedSkinId',
+        'equippedFlickStyleId',
+        'platform',
+        'crossplaySetting',
+        'updatedAt'
+      ]) &&
+      incoming().username is string && incoming().username.size() > 0 && incoming().username.size() <= 64 &&
+      incoming().equippedPenId is string && incoming().equippedPenId in existing().unlockedPens &&
+      incoming().equippedSkinId is string && incoming().equippedSkinId in existing().unlockedSkins &&
+      incoming().equippedFlickStyleId is string && incoming().equippedFlickStyleId in existing().unlockedFlickStyles &&
+      incoming().platform is string && incoming().platform in ['mobile', 'desktop'] &&
+      incoming().crossplaySetting is string && incoming().crossplaySetting in ['CROSSPLAY_ENABLED', 'SAME_PLATFORM_ONLY'] &&
+      incoming().updatedAt is timestamp &&
+      incoming().updatedAt == request.time;
     }
 
-    function prevXp() {
-      return 'xp' in existing() ? existing().xp : 0;
-    }
-
-    function prevLevel() {
-      return 'level' in existing() ? existing().level : 1;
-    }
-
-    function prevDivision() {
-      return 'division' in existing() ? existing().division : 10;
-    }
-
-    function prevTotalMatches() {
-      return 'totalMatches' in existing() ? existing().totalMatches : 0;
-    }
-
-    function prevTotalWins() {
-      return 'totalWins' in existing() ? existing().totalWins : 0;
-    }
-
-    function prevUnlockedPensCount() {
-      return 'unlockedPens' in existing() ? existing().unlockedPens.size() : 2;
-    }
-
-    function prevUnlockedSkinsCount() {
-      return 'unlockedSkins' in existing() ? existing().unlockedSkins.size() : 2;
-    }
-
-    function prevUnlockedStylesCount() {
-      return 'unlockedFlickStyles' in existing() ? existing().unlockedFlickStyles.size() : 1;
-    }
-
-    function isValidPlayerProgressionUpdate() {
-      return incoming().role == 'PLAYER' &&
-        incoming().isAdmin == false &&
-        incoming().diff(existing()).affectedKeys().hasOnly([
-          'username', 'level', 'xp', 'xpNextLevel', 'paperclips',
-          'division', 'divisionPoints', 'totalWins', 'totalMatches', 'winStreak',
-          'equippedPenId', 'equippedSkinId', 'equippedFlickStyleId',
-          'unlockedPens', 'unlockedSkins', 'unlockedFlickStyles',
-          'platform', 'crossplaySetting', 'tutorialCompleted', 'createdAt', 'updatedAt'
-        ]) &&
-        incoming().paperclips <= prevPaperclips() + 120 &&
-        incoming().xp <= prevXp() + 200 &&
-        incoming().level >= prevLevel() &&
-        incoming().level <= prevLevel() + 1 &&
-        incoming().division <= prevDivision() &&
-        incoming().division >= prevDivision() - 1 &&
-        incoming().totalMatches >= prevTotalMatches() &&
-        incoming().totalMatches <= prevTotalMatches() + 1 &&
-        incoming().totalWins >= prevTotalWins() &&
-        incoming().totalWins <= prevTotalWins() + 1 &&
-        (incoming().totalWins == prevTotalWins() || incoming().totalMatches == prevTotalMatches() + 1) &&
-        incoming().unlockedPens.size() >= prevUnlockedPensCount() &&
-        incoming().unlockedPens.size() <= prevUnlockedPensCount() + 3 &&
-        incoming().unlockedSkins.size() >= prevUnlockedSkinsCount() &&
-        incoming().unlockedSkins.size() <= prevUnlockedSkinsCount() + 1 &&
-        incoming().unlockedFlickStyles.size() >= prevUnlockedStylesCount() &&
-        incoming().unlockedFlickStyles.size() <= prevUnlockedStylesCount() + 2 &&
-        (!('tutorialCompleted' in existing()) || existing().tutorialCompleted == false || incoming().tutorialCompleted == true);
-    }
-
-    // Private User Profile Document Path (PII Isolated: email & wallet strictly owner/admin)
+    // Private User Profile Document Path (PII Isolated & Economy Locked)
     match /users/{userId} {
       allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
       allow list: if isAdmin();
 
+      // Starter profile creation only if backend did not already initialize it
       allow create: if isVerifiedUser() &&
         isValidId(userId) &&
         request.auth.uid == userId &&
-        isValidUser(incoming()) &&
+        isValidUserSchema(incoming()) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
-        (isAdmin() || isValidStarterUser(incoming()));
+        isValidStarterUser(incoming());
 
+      // Client can ONLY update cosmetic loadout & platform preferences
       allow update: if isVerifiedUser() &&
         isValidId(userId) &&
         request.auth.uid == userId &&
-        isValidUser(incoming()) &&
-        incoming().userId == existing().userId &&
-        (!('email' in existing()) || incoming().email == existing().email) &&
-        (!('createdAt' in existing()) || incoming().createdAt == existing().createdAt) &&
-        incoming().updatedAt == request.time &&
-        (isAdmin() || isValidPlayerProgressionUpdate());
+        isValidUserSchema(incoming()) &&
+        isCosmeticPrefsOnlyUpdate();
 
       allow delete: if false;
     }
 
-    function isValidLeaderboardEntry(data, userId) {
-      return data.keys().hasAll([
-        'userId', 'username', 'division', 'divisionPoints',
-        'totalWins', 'totalMatches', 'winStreak', 'equippedPenId',
-        'isAdmin', 'updatedAt'
-      ]) &&
-      data.keys().hasOnly([
-        'userId', 'username', 'division', 'divisionPoints',
-        'totalWins', 'totalMatches', 'winStreak', 'equippedPenId',
-        'isAdmin', 'updatedAt'
-      ]) &&
-      data.userId is string && data.userId == request.auth.uid && data.userId == userId && isValidId(data.userId) &&
-      data.username is string && data.username.size() > 0 && data.username.size() <= 64 &&
-      data.division is number && data.division >= 1 && data.division <= 10 &&
-      data.divisionPoints is number && data.divisionPoints >= 0 && data.divisionPoints <= 100 &&
-      data.totalWins is number && data.totalWins >= 0 && data.totalWins <= 100000 &&
-      data.totalMatches is number && data.totalMatches >= 0 && data.totalMatches <= 100000 &&
-      data.totalWins <= data.totalMatches &&
-      data.winStreak is number && data.winStreak >= 0 && data.winStreak <= data.totalWins &&
-      data.equippedPenId is string && data.equippedPenId.size() > 0 && data.equippedPenId.size() <= 64 &&
-      data.isAdmin is bool && (data.isAdmin == false || (data.isAdmin == true && isAdmin())) &&
-      data.updatedAt is timestamp &&
-      data.updatedAt == request.time &&
-      existsAfter(/databases/$(database)/documents/users/$(userId)) &&
-      getAfter(/databases/$(database)/documents/users/$(userId)).data.division == data.division &&
-      getAfter(/databases/$(database)/documents/users/$(userId)).data.totalWins == data.totalWins &&
-      getAfter(/databases/$(database)/documents/users/$(userId)).data.isAdmin == data.isAdmin;
-    }
-
-    // Public PII-Free Competitive Leaderboard Projection
+    // Public PII-Free Competitive Leaderboard Projection (Server Admin SDK Writes Only)
     match /leaderboard/{userId} {
       allow get: if isSignedIn() && isValidId(userId);
       allow list: if isSignedIn() &&
@@ -228,18 +152,7 @@ service cloud.firestore {
         resource.data.division >= 1 &&
         resource.data.division <= 10;
 
-      allow create: if isVerifiedUser() &&
-        isValidId(userId) &&
-        request.auth.uid == userId &&
-        isValidLeaderboardEntry(incoming(), userId);
-
-      allow update: if isVerifiedUser() &&
-        isValidId(userId) &&
-        request.auth.uid == userId &&
-        isValidLeaderboardEntry(incoming(), userId) &&
-        incoming().userId == existing().userId;
-
-      allow delete: if false;
+      allow create, update, delete: if false;
     }
 
     function isValidAnnouncement(data) {
@@ -258,7 +171,7 @@ service cloud.firestore {
       data.createdAt is timestamp;
     }
 
-    // Official Developer News & Announcements
+    // Official Developer News & Announcements (Custom Claim Admin Only)
     match /announcements/{announcementId} {
       allow get: if isSignedIn() && isValidId(announcementId);
       allow list: if isSignedIn() &&

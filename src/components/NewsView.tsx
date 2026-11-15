@@ -19,7 +19,7 @@ import {
   X,
   Filter
 } from 'lucide-react';
-import { collection, query, orderBy, onSnapshot, addDoc, deleteDoc, doc, serverTimestamp } from 'firebase/firestore';
+import { collection, query, orderBy, onSnapshot } from 'firebase/firestore';
 import { db, auth } from '../firebase/config';
 import { Announcement, GameView } from '../types/game';
 import { sounds } from '../utils/audio';
@@ -87,7 +87,6 @@ const FALLBACK_ANNOUNCEMENTS: Announcement[] = [
 export const NewsView: React.FC<NewsViewProps> = ({
   isAdminUser = false,
   userEmail,
-  userUid,
   onNavigate,
 }) => {
   const [announcements, setAnnouncements] = useState<Announcement[]>(FALLBACK_ANNOUNCEMENTS);
@@ -129,7 +128,6 @@ export const NewsView: React.FC<NewsViewProps> = ({
               } as Announcement;
             });
 
-            // Sort pinned first
             fetched.sort((a, b) => {
               if (a.pinned && !b.pinned) return -1;
               if (!a.pinned && b.pinned) return 1;
@@ -138,7 +136,6 @@ export const NewsView: React.FC<NewsViewProps> = ({
 
             setAnnouncements(fetched);
           } else {
-            // Keep fallbacks if no documents yet
             setAnnouncements(FALLBACK_ANNOUNCEMENTS);
           }
         },
@@ -162,26 +159,35 @@ export const NewsView: React.FC<NewsViewProps> = ({
       return;
     }
 
-    setIsPublishing(true);
-    setErrorMsg(null);
-
-    const resolvedUid = auth.currentUser?.uid || userUid;
-    if (!resolvedUid) {
-      setErrorMsg('You must be signed in to publish announcements.');
-      setIsPublishing(false);
+    const currentUser = auth.currentUser;
+    if (!currentUser || !isAdminUser) {
+      setErrorMsg('Admin privileges required to publish announcements.');
       return;
     }
 
+    setIsPublishing(true);
+    setErrorMsg(null);
+
     try {
-      await addDoc(collection(db, 'announcements'), {
-        title: newTitle.trim().slice(0, 140),
-        content: newContent.trim().slice(0, 3000),
-        category: newCategory,
-        pinned: newPinned,
-        authorName: (userEmail ? userEmail.split('@')[0] : 'Sam').slice(0, 64),
-        authorUid: resolvedUid,
-        createdAt: serverTimestamp(),
+      const token = await currentUser.getIdToken();
+      const res = await fetch('/api/announcements', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          title: newTitle.trim().slice(0, 140),
+          content: newContent.trim().slice(0, 3000),
+          category: newCategory,
+          pinned: newPinned,
+        }),
       });
+
+      const payload = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        throw new Error(payload.error || 'Failed to publish announcement.');
+      }
 
       sounds.win();
       setPublishSuccess(true);
@@ -192,9 +198,9 @@ export const NewsView: React.FC<NewsViewProps> = ({
         setPublishSuccess(false);
         setIsAuthorModalOpen(false);
       }, 1200);
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Failed to post announcement:', err);
-      setErrorMsg(err.message || 'Failed to publish to Firestore.');
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to publish announcement.');
     } finally {
       setIsPublishing(false);
     }
@@ -207,14 +213,28 @@ export const NewsView: React.FC<NewsViewProps> = ({
       return;
     }
     setConfirmDeleteId(null);
+
+    const currentUser = auth.currentUser;
+    if (!currentUser || !isAdminUser) return;
+
     try {
-      await deleteDoc(doc(db, 'announcements', id));
+      const token = await currentUser.getIdToken();
+      const res = await fetch(`/api/announcements/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (!res.ok) {
+        throw new Error('Server rejected delete request.');
+      }
       sounds.flick();
-      setAnnouncements(prev => prev.filter(a => a.id !== id));
-    } catch (err: any) {
+      setAnnouncements((prev) => prev.filter((a) => a.id !== id));
+    } catch (err) {
       console.error('Failed to delete announcement:', err);
-      // If it's a fallback item, remove from local state
-      setAnnouncements(prev => prev.filter(a => a.id !== id));
+      if (id.startsWith('ann-')) {
+        setAnnouncements((prev) => prev.filter((a) => a.id !== id));
+      }
     }
   };
 
@@ -236,7 +256,7 @@ export const NewsView: React.FC<NewsViewProps> = ({
     }
   };
 
-  const formatDate = (date: any) => {
+  const formatDate = (date: Date | string | number | null | undefined) => {
     if (!date) return 'Recently';
     const d = date instanceof Date ? date : new Date(date);
     if (isNaN(d.getTime())) return 'Recently';
@@ -477,7 +497,7 @@ export const NewsView: React.FC<NewsViewProps> = ({
                     Publish Official Announcement
                   </h3>
                   <p className="text-xs text-slate-400 font-mono">
-                    Posting as Admin ({userEmail || 'samwdoesthings@gmail.com'})
+                    Posting as Admin ({userEmail || 'Verified Admin'})
                   </p>
                 </div>
               </div>
@@ -526,7 +546,11 @@ export const NewsView: React.FC<NewsViewProps> = ({
                   </label>
                   <select
                     value={newCategory}
-                    onChange={(e: any) => setNewCategory(e.target.value)}
+                    onChange={(e) =>
+                      setNewCategory(
+                        e.target.value as 'PATCH_NOTES' | 'TOURNAMENT' | 'FEATURE' | 'ANNOUNCEMENT'
+                      )
+                    }
                     className="w-full px-4 py-3 rounded-xl bg-[#090b10] border border-slate-700 text-white text-sm font-medium focus:outline-none focus:border-[#ffe500] transition"
                   >
                     <option value="FEATURE">Feature Release</option>

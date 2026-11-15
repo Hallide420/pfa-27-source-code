@@ -186,7 +186,7 @@ export interface Announcement {
   pinned: boolean;
   authorName: string;
   authorUid: string;
-  createdAt: any;
+  createdAt: Date | string | number | null;
 }
 
 export interface TutorialLesson {
@@ -226,3 +226,17 @@ export interface OnlineFlickPayload {
   turnSeq: number;
 }
 
+export interface OnlineTurnChangePayload {
+  nextTurn: 'host' | 'guest';
+  activeTurn: 'player1' | 'player2';
+  turnSeq: number;
+  roundScore: [number, number];
+  currentRound: number;
+  pens: OnlinePenSnapshot[];
+}
+
+export interface OnlineMatchResultPayload {
+  winner: 'host' | 'guest';
+  finalScore: [number, number];
+  settlementToken?: string;
+}

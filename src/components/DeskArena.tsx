@@ -13,25 +13,21 @@ import {
   MatchMode,
   OnlineMatchSyncState,
   OnlineFlickPayload,
+  OnlinePenSnapshot,
+  OnlineTurnChangePayload,
+  OnlineMatchResultPayload,
 } from '../types/game';
 import { PENS_CATALOG, FLICK_STYLES, BOT_DIFFICULTIES } from '../data/initialData';
-import { stepPhysics, DeskBounds, distance, normalize } from '../physics/penPhysics';
+import { stepPhysics, DeskBounds, distance } from '../physics/penPhysics';
 import { sounds } from '../utils/audio';
 import { triggerHaptic, detectDevicePlatform } from '../utils/device';
 import { PenChangeModal } from './PenChangeModal';
 import {
-  RotateCcw,
   Zap,
-  Compass,
-  ShieldAlert,
   Award,
   Camera,
   Scale,
-  RefreshCw,
   Smartphone,
-  Laptop,
-  SlidersHorizontal,
-  Bot,
   Wifi,
   WifiOff,
   Clock,
@@ -46,20 +42,29 @@ interface DeskArenaProps {
   opponentAvatar?: string;
   opponentPenId?: string;
   localRole?: 'player1' | 'player2';
-  onMatchComplete: (winner: 'player1' | 'player2') => void;
+  onMatchComplete: (winner: 'player1' | 'player2', settlementToken?: string) => void;
   onExitMatch: () => void;
   onEquipPen?: (penId: string) => void;
   onSendFlick?: (power: number, angle: number, curve: number, styleId: string) => void;
   onSendSyncState?: (snapshot: OnlineMatchSyncState) => void;
+  onSendTurnChange?: (payload: {
+    nextTurn: 'host' | 'guest';
+    roundScore: [number, number];
+    currentRound: number;
+    pens: OnlinePenSnapshot[];
+  }) => void;
+  onSendMatchResult?: (payload: {
+    winner: 'host' | 'guest';
+    finalScore: [number, number];
+  }) => void;
   onRequestRematch?: () => void;
   incomingOnlineFlick?: OnlineFlickPayload | null;
   onlineSyncSnapshot?: OnlineMatchSyncState | null;
+  onlineTurnChange?: OnlineTurnChangePayload | null;
+  onlineMatchResult?: OnlineMatchResultPayload | null;
   onlineTurnSeq?: number;
   onlineConnectionStatus?: 'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED';
-  opponentConnectionStatus?: 'ONLINE' | 'RECONNECTING' | 'LEFT';
-  opponentGraceSeconds?: number;
   onlineNotice?: string | null;
-  forfeitWinner?: 'player1' | 'player2' | null;
   latencyMs?: number | null;
   rematchState?: { requestedByMe: boolean; requestedByOpponent: boolean; triggerCounter: number };
   isAdminUser?: boolean;
@@ -67,6 +72,15 @@ interface DeskArenaProps {
   playerPlatform?: 'mobile' | 'desktop';
   opponentPlatform?: 'mobile' | 'desktop';
   crossplay?: boolean;
+  rewardClips?: number;
+}
+
+interface AimState {
+  isAiming: boolean;
+  startPos: { x: number; y: number };
+  currentPos: { x: number; y: number };
+  powerNormalized: number;
+  angle: number;
 }
 
 const DESK_WIDTH = 840;
@@ -83,7 +97,7 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
   playerProfile,
   botDifficulty = 'NORMAL',
   botPenId,
-  opponentName = 'RivalStriker_X',
+  opponentName = 'Opponent',
   opponentAvatar = '🎯',
   opponentPenId,
   localRole = 'player1',
@@ -92,15 +106,16 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
   onEquipPen,
   onSendFlick,
   onSendSyncState,
+  onSendTurnChange,
+  onSendMatchResult,
   onRequestRematch,
   incomingOnlineFlick,
   onlineSyncSnapshot,
+  onlineTurnChange,
+  onlineMatchResult,
   onlineTurnSeq = 0,
   onlineConnectionStatus = 'CONNECTED',
-  opponentConnectionStatus = 'ONLINE',
-  opponentGraceSeconds = 30,
   onlineNotice = null,
-  forfeitWinner = null,
   latencyMs = null,
   rematchState,
   isAdminUser = false,
@@ -108,23 +123,99 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
   playerPlatform = detectDevicePlatform(),
   opponentPlatform = 'desktop',
   crossplay = true,
+  rewardClips = 35,
 }) => {
-  const effectiveGodMode = isAdminUser ? Math.min(5.0, Math.max(1.0, godModePower)) : 1.0;
+  // Strictly isolate God Mode power boost to verified admins in Bot Lab sparring only
+  const effectiveGodMode =
+    mode === 'BOT_BATTLE' && isAdminUser ? Math.min(5.0, Math.max(1.0, godModePower)) : 1.0;
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-  // Match state
-  const [roundScore, setRoundScore] = useState<[number, number]>([0, 0]);
-  const [currentRound, setCurrentRound] = useState<number>(1);
-  const [activeTurn, setActiveTurn] = useState<'player1' | 'player2'>('player1');
-  const [isSimulating, setIsSimulating] = useState<boolean>(false);
+  // Match state (mirrored to refs so RAF loop never tears down on state changes)
+  const [roundScore, setRoundScoreState] = useState<[number, number]>([0, 0]);
+  const [currentRound, setCurrentRoundState] = useState<number>(1);
+  const [activeTurn, setActiveTurnState] = useState<'player1' | 'player2'>('player1');
+  const [isSimulating, setIsSimulatingState] = useState<boolean>(false);
+  const [isAwaitingOnlineTurn, setIsAwaitingOnlineTurn] = useState<boolean>(false);
   const [matchWinner, setMatchWinner] = useState<'player1' | 'player2' | null>(null);
-  const [knockoutBanner, setKnockoutBanner] = useState<string | null>(null);
-  const [slowMoReplay, setSlowMoReplay] = useState<boolean>(false);
+  const [knockoutBanner, setKnockoutBannerState] = useState<string | null>(null);
+  const [slowMoReplay] = useState<boolean>(false);
+
+  const roundScoreRef = useRef<[number, number]>([0, 0]);
+  const currentRoundRef = useRef<number>(1);
+  const activeTurnRef = useRef<'player1' | 'player2'>('player1');
+  const isSimulatingRef = useRef<boolean>(false);
+  const matchWinnerRef = useRef<'player1' | 'player2' | null>(null);
+  const knockoutBannerRef = useRef<string | null>(null);
+  const slowMoReplayRef = useRef<boolean>(false);
+  const onlineTurnSeqRef = useRef<number>(onlineTurnSeq);
+
+  const setRoundScoreSync = useCallback((next: [number, number]) => {
+    roundScoreRef.current = next;
+    setRoundScoreState(next);
+  }, []);
+
+  const setCurrentRoundSync = useCallback((next: number) => {
+    currentRoundRef.current = next;
+    setCurrentRoundState(next);
+  }, []);
+
+  const setActiveTurnSync = useCallback((next: 'player1' | 'player2') => {
+    activeTurnRef.current = next;
+    setActiveTurnState(next);
+  }, []);
+
+  const setIsSimulatingSync = useCallback((next: boolean) => {
+    isSimulatingRef.current = next;
+    setIsSimulatingState(next);
+  }, []);
+
+  const setKnockoutBannerSync = useCallback((next: string | null) => {
+    knockoutBannerRef.current = next;
+    setKnockoutBannerState(next);
+  }, []);
+
+  useEffect(() => {
+    matchWinnerRef.current = matchWinner;
+  }, [matchWinner]);
+
+  useEffect(() => {
+    slowMoReplayRef.current = slowMoReplay;
+  }, [slowMoReplay]);
+
+  useEffect(() => {
+    onlineTurnSeqRef.current = onlineTurnSeq;
+  }, [onlineTurnSeq]);
+
   const matchSettledRef = useRef<boolean>(false);
-  const turnOwnerBeforeSimRef = useRef<'player1' | 'player2'>('player1');
   const lastHandledFlickSeqRef = useRef<number>(0);
   const lastHandledSyncSeqRef = useRef<number>(-1);
   const lastRematchTriggerRef = useRef<number>(0);
+  const lastSyncSentAtRef = useRef<number>(0);
+  const guestTargetPensRef = useRef<OnlinePenSnapshot[] | null>(null);
+  const pendingTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
+
+  const scheduleSafeTimeout = useCallback((fn: () => void, ms: number) => {
+    const id = setTimeout(() => {
+      pendingTimersRef.current.delete(id);
+      fn();
+    }, ms);
+    pendingTimersRef.current.add(id);
+    return id;
+  }, []);
+
+  const clearSafeTimeouts = useCallback(() => {
+    for (const id of pendingTimersRef.current) {
+      clearTimeout(id);
+    }
+    pendingTimersRef.current.clear();
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearSafeTimeouts();
+    };
+  }, [clearSafeTimeouts]);
 
   // Mobile ergonomics & Pass & Play state
   const isMobileDevice = playerPlatform === 'mobile';
@@ -135,24 +226,41 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
   // Pen change modal
   const [showPenChangeModal, setShowPenChangeModal] = useState<boolean>(false);
 
-  // Flick controls
+  // Flick controls (aimState stored in ref so pointermove never recreates RAF loop)
   const [selectedFlickStyle, setSelectedFlickStyle] = useState<FlickStyle>(() => {
     return FLICK_STYLES.find((s) => s.id === playerProfile.equippedFlickStyleId) || FLICK_STYLES[0];
   });
   const [curveModifier, setCurveModifier] = useState<number>(0);
-  const [aimState, setAimState] = useState<{
-    isAiming: boolean;
-    startPos: { x: number; y: number };
-    currentPos: { x: number; y: number };
-    powerNormalized: number;
-    angle: number;
-  }>({
+  const curveModifierRef = useRef<number>(0);
+  useEffect(() => {
+    curveModifierRef.current = curveModifier;
+  }, [curveModifier]);
+
+  const aimStateRef = useRef<AimState>({
     isAiming: false,
     startPos: { x: 0, y: 0 },
     currentPos: { x: 0, y: 0 },
     powerNormalized: 0,
     angle: 0,
   });
+
+  // Callback refs for stable RAF loop
+  const onMatchCompleteRef = useRef(onMatchComplete);
+  const onSendSyncStateRef = useRef(onSendSyncState);
+  const onSendTurnChangeRef = useRef(onSendTurnChange);
+  const onSendMatchResultRef = useRef(onSendMatchResult);
+  useEffect(() => {
+    onMatchCompleteRef.current = onMatchComplete;
+  }, [onMatchComplete]);
+  useEffect(() => {
+    onSendSyncStateRef.current = onSendSyncState;
+  }, [onSendSyncState]);
+  useEffect(() => {
+    onSendTurnChangeRef.current = onSendTurnChange;
+  }, [onSendTurnChange]);
+  useEffect(() => {
+    onSendMatchResultRef.current = onSendMatchResult;
+  }, [onSendMatchResult]);
 
   // Desk texture image
   const deskTextureRef = useRef<HTMLImageElement | null>(null);
@@ -183,6 +291,17 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       label: 'STEEL',
     },
   ]);
+
+  const buildPenSnapshots = useCallback((zeroVelocity: boolean = true): OnlinePenSnapshot[] => {
+    return pensRef.current.map((p) => ({
+      id: p.id,
+      pos: { x: p.pos.x, y: p.pos.y },
+      vel: zeroVelocity ? { x: 0, y: 0 } : { x: p.vel.x, y: p.vel.y },
+      angle: p.angle,
+      angularVel: zeroVelocity ? 0 : p.angularVel,
+      isKnockedOut: p.isKnockedOut,
+    }));
+  }, []);
 
   // Reset pens to initial face-off positions (Host = Left pen_player1, Guest = Right pen_player2)
   const resetRoundPositions = useCallback(() => {
@@ -253,24 +372,36 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       },
     ];
 
-    setIsSimulating(false);
-    setKnockoutBanner(null);
-  }, [playerProfile, mode, botPenId, opponentPenId, opponentName, localRole]);
+    guestTargetPensRef.current = null;
+    setIsSimulatingSync(false);
+    setKnockoutBannerSync(null);
+  }, [
+    playerProfile.equippedPenId,
+    playerProfile.equippedSkinId,
+    mode,
+    botPenId,
+    opponentPenId,
+    opponentName,
+    localRole,
+    setIsSimulatingSync,
+    setKnockoutBannerSync,
+  ]);
 
-  // Load desk background texture once
+  const resetRoundPositionsRef = useRef(resetRoundPositions);
+  useEffect(() => {
+    resetRoundPositionsRef.current = resetRoundPositions;
+  }, [resetRoundPositions]);
+
+  // Load desk background texture once and initialize positions when match setup changes
   useEffect(() => {
     const img = new Image();
     img.src = '/images/desk_arena_surface.jpg';
     img.onload = () => {
       deskTextureRef.current = img;
     };
-    img.onerror = () => {
-      const fallbackImg = new Image();
-      fallbackImg.src = '/src/assets/images/desk_arena_surface_1793632079226.jpg';
-      fallbackImg.onload = () => {
-        deskTextureRef.current = fallbackImg;
-      };
-    };
+  }, []);
+
+  useEffect(() => {
     resetRoundPositions();
   }, [resetRoundPositions]);
 
@@ -280,95 +411,179 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       const pen = pensRef.current.find((p) => p.id === penId);
       if (!pen || pen.isKnockedOut) return;
 
-      turnOwnerBeforeSimRef.current = pen.owner === 'player1' ? 'player1' : 'player2';
-
-      // In real physics: Delta V = Impulse / Mass
-      // Light pen (5.8g Bic, mass 0.58) -> high velocity. Heavy pen (23.5g Rotring, mass 2.35) -> lower velocity, high momentum!
-      const isLocalPen =
-        mode === 'ONLINE_ROOM' ? pen.owner === localRole : pen.owner === 'player1';
-      const impulseMultiplier = isLocalPen ? effectiveGodMode : 1.0;
+      // God Mode applies strictly in BOT_BATTLE for verified admins
+      const isBotLabLocalPen = mode === 'BOT_BATTLE' && pen.owner === 'player1';
+      const impulseMultiplier = isBotLabLocalPen ? effectiveGodMode : 1.0;
       const baseImpulse = 18.0 * style.powerBonus * powerNormalized * impulseMultiplier;
       const speed = (baseImpulse / pen.stats.mass) * pen.stats.powerMultiplier;
 
       pen.vel.x = Math.cos(angle) * speed;
       pen.vel.y = Math.sin(angle) * speed;
 
-      // Angular impulse: Torque = r x J; Delta Omega = Torque / Inertia
       const baseTorque = curve * 7.5 * style.spinBonus * pen.stats.spinMultiplier;
       pen.angularVel = baseTorque / Math.max(0.6, pen.stats.mass * 0.8);
 
       sounds.playFlick(powerNormalized);
       triggerHaptic('medium');
-      setIsSimulating(true);
+      setIsSimulatingSync(true);
     },
-    [effectiveGodMode, mode, localRole]
+    [effectiveGodMode, mode, setIsSimulatingSync]
   );
 
-  // Handle incoming online flick (with turnSeq deduplication)
+  // Host handles Guest's incoming flick input
   useEffect(() => {
-    if (incomingOnlineFlick && mode === 'ONLINE_ROOM') {
-      if (incomingOnlineFlick.turnSeq <= lastHandledFlickSeqRef.current) return;
-      lastHandledFlickSeqRef.current = incomingOnlineFlick.turnSeq;
+    if (!incomingOnlineFlick || mode !== 'ONLINE_ROOM' || localRole !== 'player1') return;
+    if (incomingOnlineFlick.turnSeq <= lastHandledFlickSeqRef.current) return;
+    lastHandledFlickSeqRef.current = incomingOnlineFlick.turnSeq;
 
-      const style =
-        FLICK_STYLES.find((s) => s.id === incomingOnlineFlick.styleId) || FLICK_STYLES[0];
-      const targetPenId =
-        incomingOnlineFlick.actor === 'player1' ? 'pen_player1' : 'pen_player2';
-      executeFlick(
-        targetPenId,
-        incomingOnlineFlick.power,
-        incomingOnlineFlick.angle,
-        incomingOnlineFlick.curve,
-        style
-      );
-    }
-  }, [incomingOnlineFlick, mode, executeFlick]);
+    const style =
+      FLICK_STYLES.find((s) => s.id === incomingOnlineFlick.styleId) || FLICK_STYLES[0];
+    const targetPenId =
+      incomingOnlineFlick.actor === 'player1' ? 'pen_player1' : 'pen_player2';
+    executeFlick(
+      targetPenId,
+      incomingOnlineFlick.power,
+      incomingOnlineFlick.angle,
+      incomingOnlineFlick.curve,
+      style
+    );
+  }, [incomingOnlineFlick, mode, localRole, executeFlick]);
 
-  // Apply authoritative peer/reconnect state snapshot
+  // Guest applies streamed 15Hz Host physics frames for smooth interpolation
   useEffect(() => {
-    if (!onlineSyncSnapshot || mode !== 'ONLINE_ROOM') return;
+    if (!onlineSyncSnapshot || mode !== 'ONLINE_ROOM' || localRole !== 'player2') return;
     if (onlineSyncSnapshot.turnSeq < lastHandledSyncSeqRef.current) return;
     lastHandledSyncSeqRef.current = onlineSyncSnapshot.turnSeq;
 
+    setIsAwaitingOnlineTurn(false);
+
     if (onlineSyncSnapshot.pens && onlineSyncSnapshot.pens.length > 0) {
+      guestTargetPensRef.current = onlineSyncSnapshot.pens;
+
+      const p1Snap = onlineSyncSnapshot.pens.find((p) => p.id === 'pen_player1');
+      const p2Snap = onlineSyncSnapshot.pens.find((p) => p.id === 'pen_player2');
+      const p1 = pensRef.current.find((p) => p.id === 'pen_player1');
+      const p2 = pensRef.current.find((p) => p.id === 'pen_player2');
+
+      const newlyKo = Boolean(
+        (p1Snap?.isKnockedOut && !p1?.isKnockedOut) ||
+          (p2Snap?.isKnockedOut && !p2?.isKnockedOut)
+      );
+
       for (const snap of onlineSyncSnapshot.pens) {
         const target = pensRef.current.find((p) => p.id === snap.id);
         if (target) {
-          target.pos = { x: snap.pos.x, y: snap.pos.y };
           target.vel = { x: snap.vel.x, y: snap.vel.y };
-          target.angle = snap.angle;
           target.angularVel = snap.angularVel;
           target.isKnockedOut = snap.isKnockedOut;
+        }
+      }
+
+      if (newlyKo && !knockoutBannerRef.current) {
+        sounds.playKnockout();
+        triggerHaptic('knockout');
+        if (p1Snap?.isKnockedOut && p2Snap?.isKnockedOut) {
+          setKnockoutBannerSync('DOUBLE RING OUT! REPLAY ROUND');
+        } else if (p2Snap?.isKnockedOut) {
+          setKnockoutBannerSync(`${p1?.name || 'Host'} KNOCKOUT STRIKE!`);
+        } else if (p1Snap?.isKnockedOut) {
+          setKnockoutBannerSync(`${p2?.name || 'Guest'} KNOCKOUT STRIKE!`);
+        }
+      }
+
+      const anyMoving = onlineSyncSnapshot.pens.some(
+        (p) => Math.hypot(p.vel.x, p.vel.y) > 0.4 || Math.abs(p.angularVel) > 0.04
+      );
+      setIsSimulatingSync(anyMoving);
+    }
+
+    setRoundScoreSync(onlineSyncSnapshot.roundScore);
+    setCurrentRoundSync(onlineSyncSnapshot.currentRound);
+    setActiveTurnSync(onlineSyncSnapshot.activeTurn);
+  }, [
+    onlineSyncSnapshot,
+    mode,
+    localRole,
+    setActiveTurnSync,
+    setCurrentRoundSync,
+    setIsSimulatingSync,
+    setKnockoutBannerSync,
+    setRoundScoreSync,
+  ]);
+
+  // Apply authoritative TURN_CHANGE from server (snap positions & swap turn deterministically)
+  useEffect(() => {
+    if (!onlineTurnChange || mode !== 'ONLINE_ROOM') return;
+
+    setIsAwaitingOnlineTurn(false);
+    setIsSimulatingSync(false);
+    setKnockoutBannerSync(null);
+    guestTargetPensRef.current = null;
+
+    if (onlineTurnChange.pens && onlineTurnChange.pens.length > 0) {
+      for (const snap of onlineTurnChange.pens) {
+        const target = pensRef.current.find((p) => p.id === snap.id);
+        if (target) {
+          target.pos = { x: snap.pos.x, y: snap.pos.y };
+          target.vel = { x: 0, y: 0 };
+          target.angle = snap.angle;
+          target.angularVel = 0;
+          target.isKnockedOut = snap.isKnockedOut;
+          target.fallAnimationProgress = undefined;
           target.trail = [];
         }
       }
     }
 
-    setIsSimulating(false);
-    setKnockoutBanner(null);
-    setRoundScore(onlineSyncSnapshot.roundScore);
-    setCurrentRound(onlineSyncSnapshot.currentRound);
-    setActiveTurn(onlineSyncSnapshot.activeTurn);
+    setRoundScoreSync(onlineTurnChange.roundScore);
+    setCurrentRoundSync(onlineTurnChange.currentRound);
+    setActiveTurnSync(onlineTurnChange.activeTurn);
+  }, [
+    onlineTurnChange,
+    mode,
+    setActiveTurnSync,
+    setCurrentRoundSync,
+    setIsSimulatingSync,
+    setKnockoutBannerSync,
+    setRoundScoreSync,
+  ]);
 
-    if (onlineSyncSnapshot.matchWinner) {
-      setMatchWinner(onlineSyncSnapshot.matchWinner);
-      if (!matchSettledRef.current) {
-        matchSettledRef.current = true;
-        onMatchComplete(onlineSyncSnapshot.matchWinner === localRole ? 'player1' : 'player2');
-      }
-    }
-  }, [onlineSyncSnapshot, mode, localRole, onMatchComplete]);
-
-  // Handle opponent forfeit / leave
+  // Apply server-minted MATCH_RESULT for BOTH Host and Guest symmetrically
   useEffect(() => {
-    if (mode !== 'ONLINE_ROOM' || !forfeitWinner) return;
-    setMatchWinner(forfeitWinner);
-    setIsSimulating(false);
+    if (!onlineMatchResult || mode !== 'ONLINE_ROOM') return;
+
+    guestTargetPensRef.current = null;
+    setIsAwaitingOnlineTurn(false);
+    setIsSimulatingSync(false);
+    setKnockoutBannerSync(null);
+
+    const winnerTableRole: 'player1' | 'player2' =
+      onlineMatchResult.winner === 'host' ? 'player1' : 'player2';
+    setRoundScoreSync(onlineMatchResult.finalScore);
+    setMatchWinner(winnerTableRole);
+
     if (!matchSettledRef.current) {
       matchSettledRef.current = true;
-      onMatchComplete(forfeitWinner === localRole ? 'player1' : 'player2');
+      onMatchCompleteRef.current(
+        winnerTableRole === localRole ? 'player1' : 'player2',
+        onlineMatchResult.settlementToken
+      );
     }
-  }, [forfeitWinner, mode, localRole, onMatchComplete]);
+  }, [
+    onlineMatchResult,
+    mode,
+    localRole,
+    setIsSimulatingSync,
+    setKnockoutBannerSync,
+    setRoundScoreSync,
+  ]);
+
+  // Clear temporary lock if server rejects an action
+  useEffect(() => {
+    if (onlineNotice) {
+      setIsAwaitingOnlineTurn(false);
+    }
+  }, [onlineNotice]);
 
   // Handle mutual online rematch start
   useEffect(() => {
@@ -378,20 +593,29 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       rematchState.triggerCounter > lastRematchTriggerRef.current
     ) {
       lastRematchTriggerRef.current = rematchState.triggerCounter;
+      clearSafeTimeouts();
       matchSettledRef.current = false;
       lastHandledFlickSeqRef.current = 0;
       lastHandledSyncSeqRef.current = -1;
       setMatchWinner(null);
-      setRoundScore([0, 0]);
-      setCurrentRound(1);
-      setActiveTurn('player1');
+      setIsAwaitingOnlineTurn(false);
+      setRoundScoreSync([0, 0]);
+      setCurrentRoundSync(1);
+      setActiveTurnSync('player1');
       resetRoundPositions();
     }
-  }, [rematchState, mode, resetRoundPositions]);
+  }, [
+    rematchState,
+    mode,
+    clearSafeTimeouts,
+    resetRoundPositions,
+    setActiveTurnSync,
+    setCurrentRoundSync,
+    setRoundScoreSync,
+  ]);
 
   // AI Opponent move calculation - Strictly active ONLY in BOT_BATTLE mode
   const triggerAiFlick = useCallback(() => {
-    // Safety check: Never run AI in Ranked, Pass & Play, or Online Room modes!
     if (mode !== 'BOT_BATTLE') return;
 
     const aiPen = pensRef.current.find((p) => p.id === 'pen_player2');
@@ -406,7 +630,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
     const dist = Math.hypot(dx, dy);
     const baseAngle = Math.atan2(dy, dx);
 
-    // Calculate distance to table boundaries
     const playerDistLeft = playerPen.pos.x - TABLE_BOUNDS.x;
     const playerDistRight = TABLE_BOUNDS.x + TABLE_BOUNDS.width - playerPen.pos.x;
     const playerDistTop = playerPen.pos.y - TABLE_BOUNDS.y;
@@ -426,23 +649,17 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
 
     switch (diffConfig.id) {
       case 'DUMMY': {
-        // Stupider AI: Wild erratic aim, pathetic underpower or suicidal full-power flings
-        const aimError = (Math.random() - 0.5) * 1.3; // ±75° wobble
+        const aimError = (Math.random() - 0.5) * 1.3;
         targetAngle = baseAngle + aimError;
-
         const behaviorRoll = Math.random();
         if (behaviorRoll < 0.45) {
-          // Underpower misfire (pen barely creeps forward 3cm)
           power = 0.12 + Math.random() * 0.14;
         } else if (behaviorRoll < 0.8) {
-          // Suicide fling: overpowered impulse directly toward the nearest rim
           power = 0.96 + Math.random() * 0.04;
           if (Math.random() < 0.5) {
-            // Aim straight at edge instead of player!
             targetAngle += (Math.random() - 0.5) * 1.5;
           }
         } else {
-          // Semi-random shot
           power = 0.45 + (Math.random() - 0.5) * 0.3;
         }
         curve = (Math.random() - 0.5) * 0.5;
@@ -450,8 +667,7 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       }
 
       case 'ROOKIE': {
-        // Rookie AI: Shaky aim, misjudged friction, no rim safety
-        targetAngle = baseAngle + (Math.random() - 0.5) * 0.48; // ±27° wobble
+        targetAngle = baseAngle + (Math.random() - 0.5) * 0.48;
         power = Math.min(
           1.0,
           Math.max(0.25, (dist / 380) * (aiPen.stats.mass / 1.1) + (Math.random() - 0.5) * 0.38)
@@ -461,8 +677,7 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       }
 
       case 'NORMAL': {
-        // Balanced AI: Decent fundamentals, consistent power, minor variance
-        targetAngle = baseAngle + (Math.random() - 0.5) * 0.14; // ±8°
+        targetAngle = baseAngle + (Math.random() - 0.5) * 0.14;
         power = Math.min(1.0, Math.max(0.35, (dist / 400) * (aiPen.stats.mass / 1.1)));
         if (minPlayerRim < 85) {
           power = Math.min(1.0, power * 1.25);
@@ -472,7 +687,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       }
 
       case 'HARD': {
-        // Smarter AI: Pushes player toward nearest rim, checks self-preservation
         let rimDx = 0;
         let rimDy = 0;
         if (minPlayerRim === playerDistLeft) rimDx = -1;
@@ -487,7 +701,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
         const massRatio = playerPen.stats.mass / aiPen.stats.mass;
         power = Math.min(1.0, Math.max(0.42, (dist / 360) * Math.sqrt(massRatio) * 1.18));
 
-        // Self-preservation: if bot is close to edge, prevent self-knockout
         if (minAiRim < 85) {
           power = Math.min(0.68, power);
         }
@@ -497,22 +710,18 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       }
 
       case 'CYBORG_APEX': {
-        // Mastermind AI: Exact physics prediction, spin induction, zero suicide
         const playerHalfL = playerPen.stats.length / 2;
-        // Hit off-center (tip or cap) to induce high rotational spin and destabilize player
         const cornerOffset = playerHalfL * 0.35;
         const contactX = playerPen.pos.x + Math.cos(playerPen.angle) * cornerOffset;
         const contactY = playerPen.pos.y + Math.sin(playerPen.angle) * cornerOffset;
 
         targetAngle = Math.atan2(contactY - aiPen.pos.y, contactX - aiPen.pos.x);
 
-        // Required impulse to push player past rim
         const neededSpeed = Math.sqrt(2 * playerPen.stats.friction * 980 * (minPlayerRim + 45));
         const impulse = (neededSpeed * playerPen.stats.mass) / playerPen.stats.powerMultiplier;
         const calculatedPower = (impulse * aiPen.stats.mass) / (18.0 * 1.25);
         power = Math.min(1.0, Math.max(0.46, calculatedPower));
 
-        // Strict boundary check: Ensure bot does not slide off after impact
         const maxSafeTravel = Math.max(15, minAiRim - 25);
         const maxSafeSpeed = Math.sqrt(2 * aiPen.stats.friction * 980 * maxSafeTravel);
         const maxSafePower = (maxSafeSpeed * aiPen.stats.mass) / 18.0;
@@ -529,25 +738,33 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
     executeFlick('pen_player2', power, targetAngle, curve, chosenStyle);
   }, [executeFlick, mode, botDifficulty]);
 
+  const triggerAiFlickRef = useRef(triggerAiFlick);
+  useEffect(() => {
+    triggerAiFlickRef.current = triggerAiFlick;
+  }, [triggerAiFlick]);
+
+  const playerUsernameRef = useRef(playerProfile.username);
+  const opponentNameRef = useRef(opponentName);
+  useEffect(() => {
+    playerUsernameRef.current = playerProfile.username;
+    opponentNameRef.current = opponentName;
+  }, [playerProfile.username, opponentName]);
+
   // Render authentic silhouettes for real pen brands
   const drawRealPenSilhouette = (ctx: CanvasRenderingContext2D, pen: PenEntity) => {
     const halfL = pen.stats.length / 2;
     const halfW = pen.stats.width / 2;
 
     if (pen.penId === 'bic_cristal') {
-      // Bic Cristal: Transparent hexagonal faceted body with blue ink tube & brass tip
-      // Hexagonal facets
       ctx.fillStyle = 'rgba(255, 255, 255, 0.45)';
       ctx.fillRect(-halfL, -halfW, pen.stats.length, pen.stats.width);
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
       ctx.lineWidth = 1;
       ctx.strokeRect(-halfL, -halfW, pen.stats.length, pen.stats.width);
 
-      // Central blue ink cartridge
       ctx.fillStyle = pen.primaryColor;
       ctx.fillRect(-halfL + 6, -1.8, pen.stats.length - 16, 3.6);
 
-      // Brass point & tungsten carbide ball
       ctx.fillStyle = '#d97706';
       ctx.beginPath();
       ctx.moveTo(halfL, -halfW * 0.6);
@@ -556,11 +773,9 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       ctx.closePath();
       ctx.fill();
 
-      // Rear vented end-plug
       ctx.fillStyle = pen.primaryColor;
       ctx.fillRect(-halfL, -halfW, 8, pen.stats.width);
     } else if (pen.penId === 'rotring_600') {
-      // Rotring 600: Matte black milled brass hexagonal body with knurled grip & red ring
       ctx.fillStyle = pen.primaryColor;
       ctx.beginPath();
       ctx.roundRect(-halfL, -halfW, pen.stats.length, pen.stats.width, 1);
@@ -569,7 +784,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       ctx.lineWidth = 1;
       ctx.stroke();
 
-      // Knurled grip pattern near tip
       ctx.fillStyle = '#27272a';
       ctx.fillRect(halfL - 28, -halfW, 18, pen.stats.width);
       ctx.strokeStyle = 'rgba(255,255,255,0.15)';
@@ -580,20 +794,15 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
         ctx.stroke();
       }
 
-      // Iconic Rotring Red Ring accent
       ctx.fillStyle = '#dc2626';
       ctx.fillRect(-halfL + 12, -halfW - 1, 3.5, pen.stats.width + 2);
 
-      // Drafting lead sleeve / steel tip
       ctx.fillStyle = '#a1a1aa';
       ctx.fillRect(halfL, -1.5, 9, 3);
     } else if (pen.penId === 'parker_jotter') {
-      // Parker Jotter: Brushed stainless steel upper cap with iconic arrow clip + plastic lower
-      // Lower plastic barrel
       ctx.fillStyle = pen.primaryColor;
       ctx.fillRect(0, -halfW, halfL, pen.stats.width);
 
-      // Upper brushed stainless steel cap
       const steelGrad = ctx.createLinearGradient(0, -halfW, 0, halfW);
       steelGrad.addColorStop(0, '#f1f5f9');
       steelGrad.addColorStop(0.5, '#cbd5e1');
@@ -601,7 +810,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       ctx.fillStyle = steelGrad;
       ctx.fillRect(-halfL, -halfW, halfL, pen.stats.width);
 
-      // Parker Arrow clip
       ctx.fillStyle = '#e2e8f0';
       ctx.fillRect(-halfL + 3, -halfW - 3, 24, 2.5);
       ctx.beginPath();
@@ -611,11 +819,9 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       ctx.closePath();
       ctx.fill();
 
-      // Steel clicker button at rear
       ctx.fillStyle = '#64748b';
       ctx.fillRect(-halfL - 4, -halfW * 0.45, 4, pen.stats.width * 0.9);
 
-      // Tip
       ctx.fillStyle = '#94a3b8';
       ctx.beginPath();
       ctx.moveTo(halfL, -halfW * 0.6);
@@ -623,19 +829,16 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       ctx.lineTo(halfL, halfW * 0.6);
       ctx.fill();
     } else if (pen.penId === 'lamy_safari') {
-      // Lamy Safari: Faceted ergonomic barrel with twin ink windows & oversized spring brass clip
       ctx.fillStyle = pen.primaryColor;
       ctx.beginPath();
       ctx.roundRect(-halfL, -halfW, pen.stats.length, pen.stats.width, 2);
       ctx.fill();
 
-      // Oval ink inspection window
       ctx.fillStyle = 'rgba(0,0,0,0.5)';
       ctx.beginPath();
       ctx.roundRect(0, -2, 10, 4, 2);
       ctx.fill();
 
-      // Oversized spring brass wire clip
       ctx.strokeStyle = '#e4e4e7';
       ctx.lineWidth = 2.5;
       ctx.beginPath();
@@ -644,7 +847,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       ctx.lineTo(-halfL + 34, -halfW + 1);
       ctx.stroke();
 
-      // Black/silver Lamy steel nib
       ctx.fillStyle = pen.tipColor;
       ctx.beginPath();
       ctx.moveTo(halfL, -halfW * 0.6);
@@ -652,7 +854,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       ctx.lineTo(halfL, halfW * 0.6);
       ctx.fill();
     } else {
-      // Default / Pilot G2 / Zebra Sarasa: Contoured barrel, rubber grip, and spring clip
       const bodyGrad = ctx.createLinearGradient(0, -halfW, 0, halfW);
       bodyGrad.addColorStop(0, pen.primaryColor);
       bodyGrad.addColorStop(0.5, pen.secondaryColor);
@@ -663,15 +864,12 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       ctx.roundRect(-halfL, -halfW, pen.stats.length, pen.stats.width, 3);
       ctx.fill();
 
-      // Rubber grip grooves
       ctx.fillStyle = pen.accentColor;
       ctx.fillRect(halfL - 24, -halfW, 14, pen.stats.width);
 
-      // Spring clip
       ctx.fillStyle = pen.clipColor || '#94a3b8';
       ctx.fillRect(-halfL + 3, -halfW - 3, 20, 2.5);
 
-      // Metal tip cone
       ctx.fillStyle = pen.stats.material === 'brass' ? '#fbbf24' : '#cbd5e1';
       ctx.beginPath();
       ctx.moveTo(halfL, -halfW * 0.7);
@@ -682,7 +880,7 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
     }
   };
 
-  // Main Simulation Loop
+  // Stable RequestAnimationFrame Simulation & Render Loop (depends only on [mode, localRole])
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -693,12 +891,44 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
     let lastTime = performance.now();
 
     const loop = (time: number) => {
-      const dt = Math.min(0.033, (time - lastTime) / 1000);
+      const dt = Math.min(0.033, Math.max(0.001, (time - lastTime) / 1000));
       lastTime = time;
 
-      if (isSimulating) {
-        const stepRate = slowMoReplay ? 0.35 : 1.0;
-        const result = stepPhysics(pensRef.current, obstaclesRef.current, TABLE_BOUNDS, dt * stepRate);
+      const isOnlineGuest = mode === 'ONLINE_ROOM' && localRole === 'player2';
+
+      if (isOnlineGuest) {
+        // Guest does NOT run its own physics — interpolates smoothly toward Host ~15Hz frames
+        const targetSnaps = guestTargetPensRef.current;
+        if (targetSnaps && targetSnaps.length > 0) {
+          const lerpAlpha = 1 - Math.exp(-22 * dt);
+          for (const snap of targetSnaps) {
+            const target = pensRef.current.find((p) => p.id === snap.id);
+            if (target) {
+              target.pos.x += (snap.pos.x - target.pos.x) * lerpAlpha;
+              target.pos.y += (snap.pos.y - target.pos.y) * lerpAlpha;
+              const angleDiff = Math.atan2(
+                Math.sin(snap.angle - target.angle),
+                Math.cos(snap.angle - target.angle)
+              );
+              target.angle += angleDiff * lerpAlpha;
+              target.isKnockedOut = snap.isKnockedOut;
+              if (snap.isKnockedOut) {
+                target.fallAnimationProgress = Math.min(
+                  1,
+                  (target.fallAnimationProgress || 0) + dt * 2.8
+                );
+              }
+            }
+          }
+        }
+      } else if (isSimulatingRef.current) {
+        const stepRate = slowMoReplayRef.current ? 0.35 : 1.0;
+        const result = stepPhysics(
+          pensRef.current,
+          obstaclesRef.current,
+          TABLE_BOUNDS,
+          dt * stepRate
+        );
 
         for (const col of result.collisions) {
           sounds.playDeskImpact(col.intensity, col.material);
@@ -707,168 +937,142 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
 
         const p1 = pensRef.current.find((p) => p.id === 'pen_player1');
         const p2 = pensRef.current.find((p) => p.id === 'pen_player2');
-
-        const p1Out = p1?.isKnockedOut;
-        const p2Out = p2?.isKnockedOut;
+        const p1Out = Boolean(p1?.isKnockedOut);
+        const p2Out = Boolean(p2?.isKnockedOut);
 
         if (p1Out || p2Out) {
-          if (!knockoutBanner) {
+          if (!knockoutBannerRef.current) {
             sounds.playKnockout();
             triggerHaptic('knockout');
             if (p1Out && p2Out) {
-              setKnockoutBanner('DOUBLE RING OUT! REPLAY ROUND');
+              setKnockoutBannerSync('DOUBLE RING OUT! REPLAY ROUND');
             } else if (p2Out) {
-              setKnockoutBanner(`${p1?.name || 'Player 1'} KNOCKOUT STRIKE!`);
+              setKnockoutBannerSync(`${p1?.name || 'Player 1'} KNOCKOUT STRIKE!`);
             } else {
-              setKnockoutBanner(`${p2?.name || 'Opponent'} KNOCKOUT STRIKE!`);
+              setKnockoutBannerSync(`${p2?.name || 'Opponent'} KNOCKOUT STRIKE!`);
             }
           }
         }
 
+        // Host streams pen positions & velocities to Guest at ~15Hz (~66ms)
+        if (mode === 'ONLINE_ROOM' && localRole === 'player1') {
+          if (time - lastSyncSentAtRef.current >= 66 || result.allStopped) {
+            lastSyncSentAtRef.current = time;
+            onSendSyncStateRef.current?.({
+              pens: buildPenSnapshots(result.allStopped),
+              activeTurn: activeTurnRef.current,
+              roundScore: roundScoreRef.current,
+              currentRound: currentRoundRef.current,
+              turnSeq: onlineTurnSeqRef.current,
+              matchWinner: null,
+            });
+          }
+        }
+
         if (result.allStopped) {
-          setIsSimulating(false);
+          setIsSimulatingSync(false);
 
-          const buildPenSnapshots = () =>
-            pensRef.current.map((p) => ({
-              id: p.id,
-              pos: { x: p.pos.x, y: p.pos.y },
-              vel: { x: 0, y: 0 },
-              angle: p.angle,
-              angularVel: 0,
-              isKnockedOut: p.isKnockedOut,
-            }));
+          if (mode === 'ONLINE_ROOM' && localRole === 'player1') {
+            const nextRole: 'player1' | 'player2' =
+              activeTurnRef.current === 'player1' ? 'player2' : 'player1';
+            const nextWsTurn: 'host' | 'guest' = nextRole === 'player2' ? 'guest' : 'host';
 
-          if (mode === 'ONLINE_ROOM') {
-            // Only the player who fired the current turn settles authoritative outcome & syncs peer
-            if (turnOwnerBeforeSimRef.current === localRole) {
-              const nextTurn: 'player1' | 'player2' =
-                activeTurn === 'player1' ? 'player2' : 'player1';
+            if (p1Out || p2Out) {
+              scheduleSafeTimeout(() => {
+                if (p1Out && p2Out) {
+                  resetRoundPositionsRef.current();
+                  setActiveTurnSync(nextRole);
+                  onSendTurnChangeRef.current?.({
+                    nextTurn: nextWsTurn,
+                    roundScore: roundScoreRef.current,
+                    currentRound: currentRoundRef.current,
+                    pens: buildPenSnapshots(true),
+                  });
+                } else {
+                  const [s1, s2] = roundScoreRef.current;
+                  const newScore: [number, number] = p2Out ? [s1 + 1, s2] : [s1, s2 + 1];
+                  setRoundScoreSync(newScore);
 
-              if (p1Out || p2Out) {
-                setTimeout(() => {
-                  if (p1Out && p2Out) {
-                    resetRoundPositions();
-                    setActiveTurn(nextTurn);
-                    onSendSyncState?.({
-                      pens: buildPenSnapshots(),
-                      activeTurn: nextTurn,
-                      roundScore,
-                      currentRound,
-                      turnSeq: onlineTurnSeq,
-                      matchWinner: null,
-                    });
-                  } else if (p2Out) {
-                    const newScore: [number, number] = [roundScore[0] + 1, roundScore[1]];
-                    const settledWinner = newScore[0] >= 2 ? 'player1' : null;
-                    const nextRnd = settledWinner ? currentRound : currentRound + 1;
-                    setRoundScore(newScore);
-                    if (settledWinner) {
-                      setMatchWinner(settledWinner);
-                      if (!matchSettledRef.current) {
-                        matchSettledRef.current = true;
-                        onMatchComplete(settledWinner === localRole ? 'player1' : 'player2');
-                      }
-                    } else {
-                      setCurrentRound(nextRnd);
-                      resetRoundPositions();
-                      setActiveTurn(nextTurn);
-                    }
-                    onSendSyncState?.({
-                      pens: buildPenSnapshots(),
-                      activeTurn: nextTurn,
-                      roundScore: newScore,
-                      currentRound: nextRnd,
-                      turnSeq: onlineTurnSeq,
-                      matchWinner: settledWinner,
+                  const winnerWsRole: 'host' | 'guest' | null =
+                    newScore[0] >= 2 ? 'host' : newScore[1] >= 2 ? 'guest' : null;
+
+                  if (winnerWsRole) {
+                    setKnockoutBannerSync(null);
+                    // Wait for authoritative server MATCH_RESULT with settlementToken so both Host and Guest settle cleanly
+                    onSendMatchResultRef.current?.({
+                      winner: winnerWsRole,
+                      finalScore: newScore,
                     });
                   } else {
-                    const newScore: [number, number] = [roundScore[0], roundScore[1] + 1];
-                    const settledWinner = newScore[1] >= 2 ? 'player2' : null;
-                    const nextRnd = settledWinner ? currentRound : currentRound + 1;
-                    setRoundScore(newScore);
-                    if (settledWinner) {
-                      setMatchWinner(settledWinner);
-                      if (!matchSettledRef.current) {
-                        matchSettledRef.current = true;
-                        onMatchComplete(settledWinner === localRole ? 'player1' : 'player2');
-                      }
-                    } else {
-                      setCurrentRound(nextRnd);
-                      resetRoundPositions();
-                      setActiveTurn(nextTurn);
-                    }
-                    onSendSyncState?.({
-                      pens: buildPenSnapshots(),
-                      activeTurn: nextTurn,
+                    const nextRnd = currentRoundRef.current + 1;
+                    setCurrentRoundSync(nextRnd);
+                    resetRoundPositionsRef.current();
+                    setActiveTurnSync(nextRole);
+                    onSendTurnChangeRef.current?.({
+                      nextTurn: nextWsTurn,
                       roundScore: newScore,
                       currentRound: nextRnd,
-                      turnSeq: onlineTurnSeq,
-                      matchWinner: settledWinner,
+                      pens: buildPenSnapshots(true),
                     });
                   }
-                }, 1400);
-              } else {
-                setActiveTurn(nextTurn);
-                onSendSyncState?.({
-                  pens: buildPenSnapshots(),
-                  activeTurn: nextTurn,
-                  roundScore,
-                  currentRound,
-                  turnSeq: onlineTurnSeq,
-                  matchWinner: null,
-                });
-              }
+                }
+              }, 1400);
+            } else {
+              setActiveTurnSync(nextRole);
+              onSendTurnChangeRef.current?.({
+                nextTurn: nextWsTurn,
+                roundScore: roundScoreRef.current,
+                currentRound: currentRoundRef.current,
+                pens: buildPenSnapshots(true),
+              });
             }
-          } else if (p1Out || p2Out) {
-            setTimeout(() => {
-              if (p1Out && p2Out) {
-                resetRoundPositions();
-              } else if (p2Out) {
-                setRoundScore(([s1, s2]) => {
-                  const newScore: [number, number] = [s1 + 1, s2];
-                  if (newScore[0] >= 2) {
-                    setMatchWinner('player1');
+          } else if (mode !== 'ONLINE_ROOM') {
+            // Local modes (BOT_BATTLE / TOURNAMENT / PASS_PLAY)
+            if (p1Out || p2Out) {
+              scheduleSafeTimeout(() => {
+                if (p1Out && p2Out) {
+                  resetRoundPositionsRef.current();
+                } else {
+                  const [s1, s2] = roundScoreRef.current;
+                  const newScore: [number, number] = p2Out ? [s1 + 1, s2] : [s1, s2 + 1];
+                  setRoundScoreSync(newScore);
+
+                  const settledWinner: 'player1' | 'player2' | null =
+                    newScore[0] >= 2 ? 'player1' : newScore[1] >= 2 ? 'player2' : null;
+
+                  if (settledWinner) {
+                    setKnockoutBannerSync(null);
+                    setMatchWinner(settledWinner);
                     if (!matchSettledRef.current) {
                       matchSettledRef.current = true;
-                      onMatchComplete('player1');
+                      onMatchCompleteRef.current(settledWinner);
                     }
                   } else {
-                    setCurrentRound((r) => r + 1);
-                    resetRoundPositions();
+                    setCurrentRoundSync(currentRoundRef.current + 1);
+                    resetRoundPositionsRef.current();
                   }
-                  return newScore;
-                });
-              } else {
-                setRoundScore(([s1, s2]) => {
-                  const newScore: [number, number] = [s1, s2 + 1];
-                  if (newScore[1] >= 2) {
-                    setMatchWinner('player2');
-                    if (!matchSettledRef.current) {
-                      matchSettledRef.current = true;
-                      onMatchComplete('player2');
-                    }
-                  } else {
-                    setCurrentRound((r) => r + 1);
-                    resetRoundPositions();
-                  }
-                  return newScore;
-                });
-              }
-            }, 1400);
-          } else {
-            setActiveTurn((prev) => {
-              const nextTurn = prev === 'player1' ? 'player2' : 'player1';
+                }
+              }, 1400);
+            } else {
+              const nextTurn: 'player1' | 'player2' =
+                activeTurnRef.current === 'player1' ? 'player2' : 'player1';
+              setActiveTurnSync(nextTurn);
+
               if (mode === 'PASS_PLAY') {
-                setPassPlayNotice(nextTurn === 'player1' ? playerProfile.username : (opponentName || 'Player 2'));
+                setPassPlayNotice(
+                  nextTurn === 'player1'
+                    ? playerUsernameRef.current
+                    : opponentNameRef.current || 'Player 2'
+                );
                 triggerHaptic('heavy');
               }
+
               if (nextTurn === 'player2' && mode === 'BOT_BATTLE') {
-                setTimeout(() => {
-                  triggerAiFlick();
+                scheduleSafeTimeout(() => {
+                  triggerAiFlickRef.current();
                 }, 800);
               }
-              return nextTurn;
-            });
+            }
           }
         }
       }
@@ -946,6 +1150,9 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       }
 
       // Draw Pens with Authentic Silhouettes
+      const currentActiveTurn = activeTurnRef.current;
+      const currentlySimulating = isSimulatingRef.current;
+
       for (const pen of pensRef.current) {
         if (pen.isKnockedOut && pen.fallAnimationProgress && pen.fallAnimationProgress >= 1) {
           continue;
@@ -955,9 +1162,10 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
         ctx.translate(pen.pos.x, pen.pos.y);
         ctx.rotate(pen.angle);
 
-        const scale = pen.isKnockedOut && pen.fallAnimationProgress
-          ? Math.max(0.1, 1 - pen.fallAnimationProgress * 0.6)
-          : 1.0;
+        const scale =
+          pen.isKnockedOut && pen.fallAnimationProgress
+            ? Math.max(0.1, 1 - pen.fallAnimationProgress * 0.6)
+            : 1.0;
         ctx.scale(scale, scale);
 
         const halfL = pen.stats.length / 2;
@@ -970,16 +1178,15 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
         ctx.fill();
 
         // Active turn outline glow
-        if (activeTurn === pen.owner && !isSimulating) {
+        const penTurnRole = pen.owner === 'player1' ? 'player1' : 'player2';
+        if (currentActiveTurn === penTurnRole && !currentlySimulating) {
           ctx.strokeStyle = '#d4f82a';
           ctx.lineWidth = 2.5;
           ctx.strokeRect(-halfL - 5, -halfW - 5, pen.stats.length + 10, pen.stats.width + 10);
         }
 
-        // Real pen brand graphics
         drawRealPenSilhouette(ctx, pen);
 
-        // Real weight label beneath pen
         ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
         ctx.font = 'bold 8px monospace';
         ctx.textAlign = 'center';
@@ -988,30 +1195,36 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
         ctx.restore();
       }
 
-      // Slingshot Aim Arrow & Prediction Line
-      if (aimState.isAiming) {
-        const activePen = pensRef.current.find((p) => p.owner === activeTurn);
+      // Slingshot Aim Arrow & Prediction Line (read directly from aimStateRef)
+      const aim = aimStateRef.current;
+      if (aim.isAiming) {
+        const activePen = pensRef.current.find(
+          (p) => (p.owner === 'player1' ? 'player1' : 'player2') === currentActiveTurn
+        );
         if (activePen) {
           ctx.save();
           const { x: px, y: py } = activePen.pos;
 
           ctx.beginPath();
           ctx.moveTo(px, py);
-          ctx.lineTo(aimState.currentPos.x, aimState.currentPos.y);
+          ctx.lineTo(aim.currentPos.x, aim.currentPos.y);
           ctx.strokeStyle = 'rgba(212, 248, 42, 0.4)';
           ctx.lineWidth = 2;
           ctx.setLineDash([5, 5]);
           ctx.stroke();
           ctx.setLineDash([]);
 
-          const forwardLen = 60 + aimState.powerNormalized * 140;
-          const fx = px + Math.cos(aimState.angle) * forwardLen;
-          const fy = py + Math.sin(aimState.angle) * forwardLen;
+          const forwardLen = 60 + aim.powerNormalized * 140;
+          const fx = px + Math.cos(aim.angle) * forwardLen;
+          const fy = py + Math.sin(aim.angle) * forwardLen;
+          const curve = curveModifierRef.current;
 
-          if (Math.abs(curveModifier) > 0.05) {
-            const curveOffset = curveModifier * 45;
-            const ctrlX = px + Math.cos(aimState.angle) * (forwardLen * 0.5) - Math.sin(aimState.angle) * curveOffset;
-            const ctrlY = py + Math.sin(aimState.angle) * (forwardLen * 0.5) + Math.cos(aimState.angle) * curveOffset;
+          if (Math.abs(curve) > 0.05) {
+            const curveOffset = curve * 45;
+            const ctrlX =
+              px + Math.cos(aim.angle) * (forwardLen * 0.5) - Math.sin(aim.angle) * curveOffset;
+            const ctrlY =
+              py + Math.sin(aim.angle) * (forwardLen * 0.5) + Math.cos(aim.angle) * curveOffset;
 
             ctx.beginPath();
             ctx.moveTo(px, py);
@@ -1035,7 +1248,7 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
 
           ctx.fillStyle = '#ffffff';
           ctx.font = 'bold 12px monospace';
-          ctx.fillText(`${Math.round(aimState.powerNormalized * 100)}%`, fx + 10, fy - 6);
+          ctx.fillText(`${Math.round(aim.powerNormalized * 100)}%`, fx + 10, fy - 6);
 
           ctx.restore();
         }
@@ -1047,33 +1260,46 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
     animId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animId);
   }, [
-    isSimulating,
-    activeTurn,
-    aimState,
-    curveModifier,
-    knockoutBanner,
-    slowMoReplay,
-    resetRoundPositions,
-    onMatchComplete,
-    onSendSyncState,
-    triggerAiFlick,
     mode,
     localRole,
-    roundScore,
-    currentRound,
-    onlineTurnSeq,
+    buildPenSnapshots,
+    scheduleSafeTimeout,
+    setActiveTurnSync,
+    setCurrentRoundSync,
+    setIsSimulatingSync,
+    setKnockoutBannerSync,
+    setRoundScoreSync,
   ]);
+
+  // Attach non-passive wheel listener on canvas so e.preventDefault() stops page scrolling
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      setCurveModifier((prev) => {
+        const next =
+          e.deltaY < 0
+            ? Math.min(1.0, +(prev + 0.1).toFixed(1))
+            : Math.max(-1.0, +(prev - 0.1).toFixed(1));
+        triggerHaptic('spin');
+        return next;
+      });
+    };
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      canvas.removeEventListener('wheel', handleWheel);
+    };
+  }, []);
 
   // Pointer Interaction Handlers for Slingshot Flick
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (isSimulating || matchWinner) return;
+    if (isSimulating || matchWinner || isAwaitingOnlineTurn) return;
     if (mode === 'RANKED' && activeTurn !== 'player1') return;
     if (mode === 'BOT_BATTLE' && activeTurn !== 'player1') return;
     if (
       mode === 'ONLINE_ROOM' &&
-      (activeTurn !== localRole ||
-        onlineConnectionStatus !== 'CONNECTED' ||
-        opponentConnectionStatus === 'RECONNECTING')
+      (activeTurn !== localRole || onlineConnectionStatus !== 'CONNECTED')
     ) {
       return;
     }
@@ -1087,24 +1313,25 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
     const clickX = (e.clientX - rect.left) * scaleX;
     const clickY = (e.clientY - rect.top) * scaleY;
 
-    const currentPen = pensRef.current.find((p) => p.owner === activeTurn);
+    const currentPen = pensRef.current.find(
+      (p) => (p.owner === 'player1' ? 'player1' : 'player2') === activeTurn
+    );
     if (!currentPen) return;
 
-    // Trigger initial tactile touch haptic
     triggerHaptic('light');
     lastPowerBracketRef.current = 0;
 
-    setAimState({
+    aimStateRef.current = {
       isAiming: true,
       startPos: { x: clickX, y: clickY },
       currentPos: { x: clickX, y: clickY },
       powerNormalized: 0,
       angle: currentPen.angle,
-    });
+    };
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!aimState.isAiming) return;
+    if (!aimStateRef.current.isAiming) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
@@ -1114,76 +1341,79 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
     const currentX = (e.clientX - rect.left) * scaleX;
     const currentY = (e.clientY - rect.top) * scaleY;
 
-    const currentPen = pensRef.current.find((p) => p.owner === activeTurn);
+    const currentPen = pensRef.current.find(
+      (p) => (p.owner === 'player1' ? 'player1' : 'player2') === activeTurn
+    );
     if (!currentPen) return;
 
-    // Use relative drag if thumb flick pad is active or user started dragging far from pen
-    const distToPen = distance(aimState.startPos, currentPen.pos);
+    const distToPen = distance(aimStateRef.current.startPos, currentPen.pos);
     const isRelativeDrag = useVirtualFlickPad || distToPen > 110;
 
-    const dx = isRelativeDrag ? currentX - aimState.startPos.x : currentX - currentPen.pos.x;
-    const dy = isRelativeDrag ? currentY - aimState.startPos.y : currentY - currentPen.pos.y;
+    const dx = isRelativeDrag
+      ? currentX - aimStateRef.current.startPos.x
+      : currentX - currentPen.pos.x;
+    const dy = isRelativeDrag
+      ? currentY - aimStateRef.current.startPos.y
+      : currentY - currentPen.pos.y;
     const pullDist = Math.hypot(dx, dy);
 
     const maxPull = 140;
     const powerNormalized = Math.min(1.0, Math.max(0.08, pullDist / maxPull));
     const flickAngle = Math.atan2(-dy, -dx);
 
-    // Tactile haptic click whenever crossing power brackets (25%, 50%, 75%, 100%)
     const bracket = Math.floor(powerNormalized * 4);
     if (bracket !== lastPowerBracketRef.current) {
       lastPowerBracketRef.current = bracket;
       triggerHaptic('powerTick');
     }
 
-    setAimState((prev) => ({
-      ...prev,
+    aimStateRef.current = {
+      ...aimStateRef.current,
       currentPos: { x: currentX, y: currentY },
       powerNormalized,
       angle: flickAngle,
-    }));
+    };
   };
 
-  const handlePointerUp = () => {
-    if (!aimState.isAiming) return;
-
-    const currentPen = pensRef.current.find((p) => p.owner === activeTurn);
-    if (currentPen && aimState.powerNormalized > 0.08) {
-      executeFlick(
-        currentPen.id,
-        aimState.powerNormalized,
-        aimState.angle,
-        curveModifier,
-        selectedFlickStyle
+  const fireActiveTurnFlick = useCallback(
+    (power: number, angle: number) => {
+      const currentPen = pensRef.current.find(
+        (p) => (p.owner === 'player1' ? 'player1' : 'player2') === activeTurnRef.current
       );
+      if (!currentPen || power <= 0.08) return;
 
-      if (mode === 'ONLINE_ROOM' && onSendFlick) {
-        onSendFlick(
-          aimState.powerNormalized,
-          aimState.angle,
-          curveModifier,
-          selectedFlickStyle.id
-        );
+      if (mode === 'ONLINE_ROOM') {
+        if (localRole === 'player1') {
+          // Host simulates locally immediately and notifies server of turn in flight
+          executeFlick(currentPen.id, power, angle, curveModifierRef.current, selectedFlickStyle);
+          onSendFlick?.(power, angle, curveModifierRef.current, selectedFlickStyle.id);
+        } else {
+          // Guest sends input to Host and awaits authoritative PEER_STATE_SYNC / TURN_CHANGE
+          sounds.playFlick(power);
+          triggerHaptic('medium');
+          setIsAwaitingOnlineTurn(true);
+          onSendFlick?.(power, angle, curveModifierRef.current, selectedFlickStyle.id);
+        }
+      } else {
+        executeFlick(currentPen.id, power, angle, curveModifierRef.current, selectedFlickStyle);
       }
-    }
+    },
+    [mode, localRole, executeFlick, onSendFlick, selectedFlickStyle]
+  );
 
-    setAimState({
+  const handlePointerUp = () => {
+    if (!aimStateRef.current.isAiming) return;
+    const { powerNormalized, angle } = aimStateRef.current;
+
+    aimStateRef.current = {
       isAiming: false,
       startPos: { x: 0, y: 0 },
       currentPos: { x: 0, y: 0 },
       powerNormalized: 0,
       angle: 0,
-    });
-  };
+    };
 
-  // PC Mouse wheel to adjust curve/spin on the fly
-  const handleCanvasWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
-    e.preventDefault();
-    setCurveModifier((prev) => {
-      const next = e.deltaY < 0 ? Math.min(1.0, +(prev + 0.1).toFixed(1)) : Math.max(-1.0, +(prev - 0.1).toFixed(1));
-      triggerHaptic('spin');
-      return next;
-    });
+    fireActiveTurnFlick(powerNormalized, angle);
   };
 
   // PC Keyboard Shortcuts (1-6 for styles, Q/E for spin, Space for flick, R for rematch)
@@ -1192,7 +1422,7 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       if (showPenChangeModal) return;
 
       if (e.key >= '1' && e.key <= '6') {
-        const idx = parseInt(e.key) - 1;
+        const idx = parseInt(e.key, 10) - 1;
         if (FLICK_STYLES[idx] && playerProfile.unlockedFlickStyles.includes(FLICK_STYLES[idx].id)) {
           setSelectedFlickStyle(FLICK_STYLES[idx]);
           sounds.playClick();
@@ -1218,40 +1448,39 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
           if (mode === 'ONLINE_ROOM') {
             onRequestRematch?.();
           } else {
+            clearSafeTimeouts();
             matchSettledRef.current = false;
             setMatchWinner(null);
-            setRoundScore([0, 0]);
-            setCurrentRound(1);
-            setActiveTurn('player1');
+            setRoundScoreSync([0, 0]);
+            setCurrentRoundSync(1);
+            setActiveTurnSync('player1');
             resetRoundPositions();
           }
         }
-      } else if (e.key === ' ' && !isSimulating && !matchWinner) {
+      } else if (e.key === ' ' && !isSimulating && !matchWinner && !isAwaitingOnlineTurn) {
         if (mode === 'RANKED' && activeTurn !== 'player1') return;
         if (mode === 'BOT_BATTLE' && activeTurn !== 'player1') return;
         if (
           mode === 'ONLINE_ROOM' &&
-          (activeTurn !== localRole ||
-            onlineConnectionStatus !== 'CONNECTED' ||
-            opponentConnectionStatus === 'RECONNECTING')
+          (activeTurn !== localRole || onlineConnectionStatus !== 'CONNECTED')
         ) {
           return;
         }
-        const currentPen = pensRef.current.find((p) => p.owner === activeTurn);
+        const currentPen = pensRef.current.find(
+          (p) => (p.owner === 'player1' ? 'player1' : 'player2') === activeTurn
+        );
         if (currentPen) {
-          const power = aimState.isAiming && aimState.powerNormalized > 0.1 ? aimState.powerNormalized : 0.75;
-          const angle = aimState.isAiming ? aimState.angle : currentPen.angle;
-          executeFlick(currentPen.id, power, angle, curveModifier, selectedFlickStyle);
-          if (mode === 'ONLINE_ROOM' && onSendFlick) {
-            onSendFlick(power, angle, curveModifier, selectedFlickStyle.id);
-          }
-          setAimState({
+          const aim = aimStateRef.current;
+          const power = aim.isAiming && aim.powerNormalized > 0.1 ? aim.powerNormalized : 0.75;
+          const angle = aim.isAiming ? aim.angle : currentPen.angle;
+          aimStateRef.current = {
             isAiming: false,
             startPos: { x: 0, y: 0 },
             currentPos: { x: 0, y: 0 },
             powerNormalized: 0,
             angle: 0,
-          });
+          };
+          fireActiveTurnFlick(power, angle);
         }
       }
     };
@@ -1261,19 +1490,19 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
     showPenChangeModal,
     matchWinner,
     isSimulating,
+    isAwaitingOnlineTurn,
     activeTurn,
-    curveModifier,
-    selectedFlickStyle,
     playerProfile.unlockedFlickStyles,
     resetRoundPositions,
-    executeFlick,
-    aimState,
+    fireActiveTurnFlick,
     mode,
     localRole,
     onlineConnectionStatus,
-    opponentConnectionStatus,
-    onSendFlick,
     onRequestRematch,
+    clearSafeTimeouts,
+    setActiveTurnSync,
+    setCurrentRoundSync,
+    setRoundScoreSync,
   ]);
 
   const p1Pen = pensRef.current.find((p) => p.id === 'pen_player1');
@@ -1286,22 +1515,24 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
   const myPen = isLocalP2 ? p2Pen : p1Pen;
   const isMyTurn =
     mode === 'ONLINE_ROOM'
-      ? activeTurn === localRole
+      ? activeTurn === localRole && !isAwaitingOnlineTurn
       : mode === 'PASS_PLAY'
       ? true
       : activeTurn === 'player1';
   const didLocalPlayerWin =
-    matchWinner !== null && (mode === 'ONLINE_ROOM' ? matchWinner === localRole : matchWinner === 'player1');
+    matchWinner !== null &&
+    (mode === 'ONLINE_ROOM' ? matchWinner === localRole : matchWinner === 'player1');
 
   return (
     <div className="flex flex-col items-center w-full max-w-5xl mx-auto px-2 sm:px-4 py-2 sm:py-3 touch-none select-none">
       {/* Mobile Compact Broadcast Scorebug (< 640px) */}
       <div className="sm:hidden w-full bg-[#0e121b] border-2 border-white p-2 mb-2 shadow-brutal-yellow">
         <div className="flex items-center justify-between gap-1.5">
-          {/* Left Side Pen (P1 / Host) */}
-          <div className={`flex items-center gap-1.5 px-2 py-1 border transition-all ${
-            activeTurn === 'player1' ? 'bg-[#ffe500]/20 border-[#ffe500] shadow-sm' : 'border-white/10'
-          }`}>
+          <div
+            className={`flex items-center gap-1.5 px-2 py-1 border transition-all ${
+              activeTurn === 'player1' ? 'bg-[#ffe500]/20 border-[#ffe500] shadow-sm' : 'border-white/10'
+            }`}
+          >
             <span className="text-sm">{leftPlatform === 'mobile' ? '📱' : '🖥️'}</span>
             <div className="flex flex-col leading-none">
               <span className="font-broadcast text-xs font-black uppercase text-white truncate max-w-[85px]">
@@ -1313,7 +1544,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
             </div>
           </div>
 
-          {/* Center Broadcast Score */}
           <div className="flex flex-col items-center">
             <div className="flex items-center gap-1.5 px-2.5 py-0.5 bg-black border border-white font-mono text-xl font-black text-white tabular-nums">
               <span className={roundScore[0] > roundScore[1] ? 'text-[#ffe500]' : 'text-slate-200'}>
@@ -1329,10 +1559,11 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
             </span>
           </div>
 
-          {/* Right Side Pen (P2 / Guest) */}
-          <div className={`flex items-center gap-1.5 px-2 py-1 border text-right transition-all ${
-            activeTurn === 'player2' ? 'bg-red-500/20 border-red-500 shadow-sm' : 'border-white/10'
-          }`}>
+          <div
+            className={`flex items-center gap-1.5 px-2 py-1 border text-right transition-all ${
+              activeTurn === 'player2' ? 'bg-red-500/20 border-red-500 shadow-sm' : 'border-white/10'
+            }`}
+          >
             <div className="flex flex-col items-end leading-none">
               <span className="font-broadcast text-xs font-black uppercase text-white truncate max-w-[85px]">
                 {isLocalP2 ? `${rightName} (YOU)` : rightName}
@@ -1348,7 +1579,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
 
       {/* Desktop Broadcast Scoreboard Header (>= 640px) */}
       <div className="hidden sm:flex w-full items-center justify-between bg-[#0e121b] border-4 border-white px-6 py-3 mb-2 shadow-brutal-yellow">
-        {/* Left Card (Player 1 / Host) */}
         <div className="flex items-center gap-3">
           <div className="w-11 h-11 bg-[#ffe500] border-2 border-black flex items-center justify-center text-xl shadow-brutal-black">
             {isLocalP2 ? opponentAvatar : '🖋️'}
@@ -1363,7 +1593,10 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
                   YOU · DIV {playerProfile.division}
                 </span>
               )}
-              <span className="text-xs px-1.5 py-0.5 bg-black border border-white/30 text-slate-300 font-mono" title={`Platform: ${leftPlatform}`}>
+              <span
+                className="text-xs px-1.5 py-0.5 bg-black border border-white/30 text-slate-300 font-mono"
+                title={`Platform: ${leftPlatform}`}
+              >
                 {leftPlatform === 'mobile' ? '📱 Mobile' : '🖥️ PC'}
               </span>
             </div>
@@ -1379,7 +1612,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
           </div>
         </div>
 
-        {/* Center Match Score (Best of 3) */}
         <div className="flex flex-col items-center">
           <div className="flex items-center gap-3 px-5 py-1 bg-black border-2 border-white font-mono text-3xl font-black text-white shadow-brutal-black tabular-nums">
             <span className={roundScore[0] > roundScore[1] ? 'text-[#ffe500]' : 'text-slate-200'}>
@@ -1395,12 +1627,11 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
           </span>
           {effectiveGodMode > 1.0 && (
             <span className="mt-1 px-2 py-0.5 bg-[#ffe500] text-black text-[9px] font-mono font-black border border-black shadow-sm">
-              DEV GOD-MODE: {effectiveGodMode}X
+              BOT LAB GOD-MODE: {effectiveGodMode}X
             </span>
           )}
         </div>
 
-        {/* Right Card (Player 2 / Guest) */}
         <div className="flex items-center gap-3">
           <div className="text-right">
             <div className="flex items-center justify-end gap-2">
@@ -1415,7 +1646,10 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
                       YOU · DIV {playerProfile.division}
                     </span>
                   )}
-                  <span className="text-xs px-1.5 py-0.5 bg-black border border-white/30 text-slate-300 font-mono" title={`Platform: ${rightPlatform}`}>
+                  <span
+                    className="text-xs px-1.5 py-0.5 bg-black border border-white/30 text-slate-300 font-mono"
+                    title={`Platform: ${rightPlatform}`}
+                  >
                     {rightPlatform === 'mobile' ? '📱 Mobile' : '🖥️ PC'}
                   </span>
                 </>
@@ -1452,19 +1686,20 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
             ) : (
               <span className="inline-flex items-center gap-1 text-amber-400 font-bold animate-pulse">
                 <WifiOff className="w-3.5 h-3.5" />
-                {onlineConnectionStatus}...
+                {onlineConnectionStatus === 'RECONNECTING' ? 'Reconnecting…' : 'Disconnected'}
               </span>
             )}
             <span className="text-slate-500">|</span>
             <span className="text-slate-300">
-              SIDE: <strong className="text-[#ffe500]">{localRole === 'player1' ? 'LEFT (HOST)' : 'RIGHT (GUEST)'}</strong>
+              SIDE:{' '}
+              <strong className="text-[#ffe500]">
+                {localRole === 'player1' ? 'LEFT (HOST · AUTHORITATIVE)' : 'RIGHT (GUEST · SYNCED)'}
+              </strong>
             </span>
           </div>
 
           <div className="flex items-center gap-2">
-            {onlineNotice && (
-              <span className="text-amber-300 font-bold">{onlineNotice}</span>
-            )}
+            {onlineNotice && <span className="text-amber-300 font-bold">{onlineNotice}</span>}
             <span
               className={`px-2 py-0.5 font-black uppercase border ${
                 isMyTurn
@@ -1472,7 +1707,11 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
                   : 'bg-slate-800 text-slate-300 border-slate-600'
               }`}
             >
-              {isMyTurn ? 'YOUR TURN TO FLICK' : `${opponentName.toUpperCase()}'S TURN`}
+              {isAwaitingOnlineTurn
+                ? 'SYNCING FLICK...'
+                : isMyTurn
+                ? 'YOUR TURN TO FLICK'
+                : `${opponentName.toUpperCase()}'S TURN`}
             </span>
           </div>
         </div>
@@ -1489,7 +1728,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          onWheel={handleCanvasWheel}
         />
 
         {/* Slow-mo Replay & Knockout Banner Overlay */}
@@ -1517,7 +1755,7 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
                 📱
               </div>
               <span className="text-xs uppercase font-mono font-bold tracking-widest text-[#ffe500] mb-1 block">
-                PASS & PLAY TURN HANDOVER
+                PASS &amp; PLAY TURN HANDOVER
               </span>
               <h3 className="font-broadcast text-3xl font-black italic uppercase text-white mb-2">
                 PASS TO {passPlayNotice}!
@@ -1539,25 +1777,21 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
           </div>
         )}
 
-        {/* Opponent / Self Reconnecting Grace Overlay */}
-        {mode === 'ONLINE_ROOM' && !matchWinner && (onlineConnectionStatus === 'RECONNECTING' || opponentConnectionStatus === 'RECONNECTING') && (
+        {/* Self Reconnecting Overlay */}
+        {mode === 'ONLINE_ROOM' && !matchWinner && onlineConnectionStatus === 'RECONNECTING' && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/85 backdrop-blur-sm p-4 z-35">
             <div className="bg-[#0e121b] border-4 border-amber-400 p-5 max-w-sm w-full text-center shadow-brutal-yellow">
               <div className="w-12 h-12 bg-amber-400 text-black border-2 border-black mx-auto flex items-center justify-center mb-3 animate-pulse">
                 <Clock className="w-6 h-6" />
               </div>
               <span className="text-[10px] font-mono font-black uppercase tracking-widest text-amber-400">
-                {onlineConnectionStatus === 'RECONNECTING' ? 'YOUR CONNECTION DROPPED' : 'OPPONENT CONNECTION INTERRUPTED'}
+                CONNECTION INTERRUPTED
               </span>
               <h3 className="font-broadcast text-2xl font-black italic uppercase text-white mt-1">
-                {onlineConnectionStatus === 'RECONNECTING'
-                  ? 'RECONNECTING TO MATCH...'
-                  : `WAITING FOR ${opponentName.toUpperCase()}`}
+                Reconnecting…
               </h3>
               <p className="text-xs text-slate-300 font-mono mt-2">
-                {onlineConnectionStatus === 'RECONNECTING'
-                  ? 'Restoring WebSocket room session automatically.'
-                  : `Match paused. Forfeit victory awarded in ${opponentGraceSeconds}s if rival does not return.`}
+                Attempting to restore your live room session.
               </p>
             </div>
           </div>
@@ -1585,15 +1819,15 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
                 <Award className="w-8 h-8" />
               </div>
               <span className="text-xs uppercase font-mono font-bold tracking-widest text-[#ffe500] mb-1 block">
-                {forfeitWinner ? 'OPPONENT FORFEITED // MATCH SETTLED' : 'MATCH SETTLED // BOUT COMPLETED'}
+                MATCH SETTLED // FINAL SCORE {roundScore[0]} : {roundScore[1]}
               </span>
               <h3 className="font-broadcast text-3xl sm:text-5xl font-black italic uppercase text-white mb-2">
                 {didLocalPlayerWin ? `${playerProfile.username} WINS!` : `${opponentName} WINS!`}
               </h3>
               <p className="text-slate-300 text-xs sm:text-sm mb-6">
                 {didLocalPlayerWin
-                  ? '+35 Paperclips secured! Progression XP saved to cloud profile.'
-                  : 'Fell off the wood rim. Calibrate your flick angle for the rematch!'}
+                  ? `+${rewardClips} Paperclips secured! Progression XP saved to cloud profile.`
+                  : '+5 Consolation Paperclips earned. Calibrate your flick angle for the rematch!'}
               </p>
               {mode === 'ONLINE_ROOM' && rematchState?.requestedByOpponent && !rematchState?.requestedByMe && (
                 <div className="mb-3 px-3 py-1.5 bg-emerald-500/20 border border-emerald-400 text-emerald-300 font-mono text-xs font-bold">
@@ -1601,31 +1835,30 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
                 </div>
               )}
               <div className="flex flex-col sm:flex-row items-center gap-3">
-                {mode === 'ONLINE_ROOM' && forfeitWinner ? null : (
-                  <button
-                    onClick={() => {
-                      sounds.playClick();
-                      if (mode === 'ONLINE_ROOM') {
-                        onRequestRematch?.();
-                      } else {
-                        matchSettledRef.current = false;
-                        setMatchWinner(null);
-                        setRoundScore([0, 0]);
-                        setCurrentRound(1);
-                        setActiveTurn('player1');
-                        resetRoundPositions();
-                      }
-                    }}
-                    disabled={mode === 'ONLINE_ROOM' && rematchState?.requestedByMe}
-                    className="w-full py-3 bg-[#ffe500] hover:bg-[#ebd300] text-black font-broadcast font-black text-sm uppercase tracking-wider border-2 border-black shadow-brutal-white cursor-pointer active:scale-95 disabled:opacity-60"
-                  >
-                    {mode === 'ONLINE_ROOM'
-                      ? rematchState?.requestedByMe
-                        ? 'Waiting for Rival...'
-                        : 'Request Rematch (R)'
-                      : 'Instant Rematch (Press R)'}
-                  </button>
-                )}
+                <button
+                  onClick={() => {
+                    sounds.playClick();
+                    if (mode === 'ONLINE_ROOM') {
+                      onRequestRematch?.();
+                    } else {
+                      clearSafeTimeouts();
+                      matchSettledRef.current = false;
+                      setMatchWinner(null);
+                      setRoundScoreSync([0, 0]);
+                      setCurrentRoundSync(1);
+                      setActiveTurnSync('player1');
+                      resetRoundPositions();
+                    }
+                  }}
+                  disabled={mode === 'ONLINE_ROOM' && rematchState?.requestedByMe}
+                  className="w-full py-3 bg-[#ffe500] hover:bg-[#ebd300] text-black font-broadcast font-black text-sm uppercase tracking-wider border-2 border-black shadow-brutal-white cursor-pointer active:scale-95 disabled:opacity-60"
+                >
+                  {mode === 'ONLINE_ROOM'
+                    ? rematchState?.requestedByMe
+                      ? 'Waiting for Rival...'
+                      : 'Request Rematch (R)'
+                    : 'Instant Rematch (Press R)'}
+                </button>
                 <button
                   onClick={() => {
                     sounds.playClick();
@@ -1644,11 +1877,21 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
       {/* PC Keyboard Shortcuts HUD Bar (Desktop only) */}
       <div className="hidden lg:flex items-center justify-between w-full px-3 py-1.5 mt-2 bg-black/60 border border-white/10 text-[10px] font-mono text-slate-400">
         <div className="flex items-center gap-4">
-          <span><strong className="text-white bg-white/10 px-1 border border-white/20">1-6</strong> Technique Styles</span>
-          <span><strong className="text-white bg-white/10 px-1 border border-white/20">Q / E</strong> Curve Left/Right</span>
-          <span><strong className="text-white bg-white/10 px-1 border border-white/20">Scroll Wheel</strong> Spin</span>
-          <span><strong className="text-white bg-white/10 px-1 border border-white/20">Space</strong> Flick</span>
-          <span><strong className="text-white bg-white/10 px-1 border border-white/20">R</strong> Rematch</span>
+          <span>
+            <strong className="text-white bg-white/10 px-1 border border-white/20">1-6</strong> Technique Styles
+          </span>
+          <span>
+            <strong className="text-white bg-white/10 px-1 border border-white/20">Q / E</strong> Curve Left/Right
+          </span>
+          <span>
+            <strong className="text-white bg-white/10 px-1 border border-white/20">Scroll Wheel</strong> Spin
+          </span>
+          <span>
+            <strong className="text-white bg-white/10 px-1 border border-white/20">Space</strong> Flick
+          </span>
+          <span>
+            <strong className="text-white bg-white/10 px-1 border border-white/20">R</strong> Rematch
+          </span>
         </div>
         <div className="flex items-center gap-2 text-[#ffe500]">
           <span>CROSSPLAY: {crossplay ? 'ENABLED' : 'SOLO'}</span>
@@ -1657,9 +1900,7 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
 
       {/* Interactive Controls Bar */}
       <div className="w-full flex flex-col md:flex-row items-center justify-between gap-3 mt-3 bg-[#0e121b] border-2 border-white/20 p-3 sm:p-4 shadow-brutal-black">
-        {/* Row 1 on mobile: Weapon Button & Pad Toggle */}
         <div className="flex items-center justify-between w-full md:w-auto gap-2">
-          {/* Quick Pen Changer Button */}
           <button
             onClick={() => {
               sounds.playClick();
@@ -1671,7 +1912,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
             <span>Weapon ({myPen?.stats.weightGrams || p1Pen?.stats.weightGrams}g)</span>
           </button>
 
-          {/* Virtual Thumb Pad Toggle */}
           <button
             onClick={() => {
               triggerHaptic('light');
@@ -1732,9 +1972,8 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
           })}
         </div>
 
-        {/* Trajectory Spin Controls (Quick Steppers + Slider) */}
+        {/* Trajectory Spin Controls */}
         <div className="flex items-center justify-between w-full md:w-auto gap-2">
-          {/* Quick Curve Steppers for Mobile */}
           <div className="flex items-center gap-1 bg-black p-1 border border-white/20">
             <button
               onClick={() => {
@@ -1774,7 +2013,6 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
             </span>
           </div>
 
-          {/* Reset / Quit button */}
           <button
             onClick={() => {
               sounds.playClick();
@@ -1794,7 +2032,7 @@ export const DeskArena: React.FC<DeskArenaProps> = ({
           profile={playerProfile}
           onSelectPen={(penId) => {
             if (onEquipPen) onEquipPen(penId);
-            setTimeout(() => resetRoundPositions(), 50);
+            scheduleSafeTimeout(() => resetRoundPositions(), 50);
           }}
           onClose={() => setShowPenChangeModal(false)}
         />

@@ -5,25 +5,24 @@
 
 import React, { useState } from 'react';
 import { Tournament, TournamentMatch, PlayerProfile } from '../types/game';
-import { INITIAL_TOURNAMENTS } from '../data/initialData';
 import { sounds } from '../utils/audio';
-import { Trophy, Lock, Unlock, Play, AlertCircle } from 'lucide-react';
+import { Trophy, Lock, Unlock, Play, AlertCircle, RotateCcw, CheckCircle2 } from 'lucide-react';
 
 interface TournamentBracketViewProps {
   profile: PlayerProfile;
+  tournaments: Tournament[];
   isAdminUser?: boolean;
   onStartTournamentMatch: (tournament: Tournament, match: TournamentMatch) => void;
+  onResetTournament?: (tournamentId: string) => void;
 }
 
 export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
-  profile,
+  tournaments,
   isAdminUser = false,
   onStartTournamentMatch,
+  onResetTournament,
 }) => {
-  const [tournaments] = useState<Tournament[]>(() => {
-    return INITIAL_TOURNAMENTS;
-  });
-  const [selectedTourneyId, setSelectedTourneyId] = useState<string>(tournaments[0].id);
+  const [selectedTourneyId, setSelectedTourneyId] = useState<string>(tournaments[0]?.id || '');
   const [passcodeInputs, setPasscodeInputs] = useState<Record<string, string>>({});
   const [unlockedClosed, setUnlockedClosed] = useState<Record<string, boolean>>({});
   const [passcodeError, setPasscodeError] = useState<string | null>(null);
@@ -44,7 +43,6 @@ export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
     }
   };
 
-  // Find user's current pending match in selected tournament
   const userMatch = selectedTourney.matches.find(
     (m) =>
       m.round === selectedTourney.currentRound &&
@@ -55,6 +53,14 @@ export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
   const qfMatches = selectedTourney.matches.filter((m) => m.round === 1);
   const sfMatches = selectedTourney.matches.filter((m) => m.round === 2);
   const finalMatches = selectedTourney.matches.filter((m) => m.round === 3);
+
+  const userFinalMatch = finalMatches[0];
+  const userWonCup = Boolean(
+    selectedTourney.isCompleted &&
+      userFinalMatch &&
+      ((userFinalMatch.winner === 1 && userFinalMatch.player1.isUser) ||
+        (userFinalMatch.winner === 2 && userFinalMatch.player2.isUser))
+  );
 
   return (
     <div className="w-full max-w-6xl mx-auto px-4 py-6 font-sans">
@@ -73,14 +79,14 @@ export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
             TOURNAMENT BRACKETS
           </h2>
           <p className="text-neutral-700 font-mono text-xs sm:text-sm mt-2">
-            Developer-hosted classroom cups: open city qualifiers and closed invitationals with verified real-life pen physics.
+            Developer-hosted classroom cups: open city qualifiers and closed invitationals with saved per-account bracket progression.
           </p>
         </div>
 
         {/* Tournament Switcher Tabs */}
         <div className="flex flex-wrap gap-2">
           {tournaments.map((t) => {
-            const isSelected = t.id === selectedTourneyId;
+            const isSelected = t.id === selectedTourney.id;
             const isLocked = t.requiresPasscode && !unlockedClosed[t.id];
 
             return (
@@ -168,68 +174,74 @@ export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
           {/* Active Tournament Details & CTA */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 p-5 bg-white border-4 border-black shadow-brutal-black">
             <div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 flex-wrap">
                 <span className="font-broadcast text-3xl font-black italic text-black">
                   {selectedTourney.name}
                 </span>
                 <span className="font-mono text-xs px-2 py-0.5 bg-[#ffe500] text-black border border-black font-black uppercase">
                   {selectedTourney.type} CUP
                 </span>
+                {userWonCup && (
+                  <span className="font-mono text-xs px-2 py-0.5 bg-emerald-500 text-white border border-black font-black uppercase flex items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" /> CHAMPION
+                  </span>
+                )}
               </div>
               <p className="font-mono text-xs text-neutral-700 mt-1">
-                TROPHY: <strong className="text-black font-black">{selectedTourney.trophyName}</strong> · GRAND REWARD: <strong className="text-black font-black bg-[#ffe500] px-1 border border-black">{selectedTourney.rewardClips} PAPERCLIPS</strong>
+                TROPHY: <strong className="text-black font-black">{selectedTourney.trophyName}</strong> · GRAND REWARD: <strong className="text-black font-black bg-[#ffe500] px-1 border border-black">+80 CLIPS / ROUND</strong>
               </p>
             </div>
 
-            {userMatch && (
-              <button
-                onClick={() => {
-                  sounds.playClick();
-                  onStartTournamentMatch(selectedTourney, userMatch);
-                }}
-                className="flex items-center justify-center gap-2 px-6 py-3.5 bg-[#ffe500] hover:bg-[#f2d700] text-black font-broadcast font-black text-xl uppercase tracking-wider border-3 border-black shadow-brutal-black hover:translate-x-0.5 hover:translate-y-0.5 transition-all cursor-pointer whitespace-nowrap shrink-0"
-              >
-                <Play className="w-5 h-5 fill-black" />
-                PLAY ROUND {selectedTourney.currentRound} MATCH
-              </button>
-            )}
+            <div className="flex items-center gap-2 flex-wrap">
+              {userMatch && (
+                <button
+                  onClick={() => {
+                    sounds.playClick();
+                    onStartTournamentMatch(selectedTourney, userMatch);
+                  }}
+                  className="flex items-center justify-center gap-2 px-6 py-3.5 bg-[#ffe500] hover:bg-[#f2d700] text-black font-broadcast font-black text-xl uppercase tracking-wider border-3 border-black shadow-brutal-black hover:translate-x-0.5 hover:translate-y-0.5 transition-all cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Play className="w-5 h-5 fill-black" />
+                  PLAY ROUND {selectedTourney.currentRound} MATCH
+                </button>
+              )}
+
+              {(selectedTourney.isCompleted || selectedTourney.currentRound > 1) && onResetTournament && (
+                <button
+                  onClick={() => {
+                    sounds.playClick();
+                    onResetTournament(selectedTourney.id);
+                  }}
+                  className="flex items-center gap-1.5 px-4 py-3 bg-neutral-100 hover:bg-neutral-200 text-black font-mono text-xs font-black uppercase border-2 border-black cursor-pointer"
+                  title="Reset bracket to Quarterfinals"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Reset Cup</span>
+                </button>
+              )}
+            </div>
           </div>
 
           {/* Mobile Round Switcher (< md) */}
           <div className="md:hidden flex items-center justify-between gap-1 p-2 bg-neutral-100 border-2 border-black">
-            <button
-              onClick={() => {
-                sounds.playClick();
-                setMobileRoundTab(1);
-              }}
-              className={`flex-1 py-1.5 text-xs font-broadcast font-black uppercase border border-black transition-all ${
-                mobileRoundTab === 1 ? 'bg-[#ffe500] text-black shadow-sm' : 'bg-white text-black'
-              }`}
-            >
-              1: Quarterfinals
-            </button>
-            <button
-              onClick={() => {
-                sounds.playClick();
-                setMobileRoundTab(2);
-              }}
-              className={`flex-1 py-1.5 text-xs font-broadcast font-black uppercase border border-black transition-all ${
-                mobileRoundTab === 2 ? 'bg-[#ffe500] text-black shadow-sm' : 'bg-white text-black'
-              }`}
-            >
-              2: Semifinals
-            </button>
-            <button
-              onClick={() => {
-                sounds.playClick();
-                setMobileRoundTab(3);
-              }}
-              className={`flex-1 py-1.5 text-xs font-broadcast font-black uppercase border border-black transition-all ${
-                mobileRoundTab === 3 ? 'bg-[#ffe500] text-black shadow-sm' : 'bg-white text-black'
-              }`}
-            >
-              3: Grand Final
-            </button>
+            {[
+              { round: 1, label: '1: Quarterfinals' },
+              { round: 2, label: '2: Semifinals' },
+              { round: 3, label: '3: Grand Final' },
+            ].map((item) => (
+              <button
+                key={item.round}
+                onClick={() => {
+                  sounds.playClick();
+                  setMobileRoundTab(item.round);
+                }}
+                className={`flex-1 py-1.5 text-xs font-broadcast font-black uppercase border border-black transition-all ${
+                  mobileRoundTab === item.round ? 'bg-[#ffe500] text-black shadow-sm' : 'bg-white text-black'
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
           </div>
 
           {/* 3-Column Bracket Tree */}
@@ -282,11 +294,15 @@ export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
                 {sfMatches.map((match) => (
                   <div
                     key={match.id}
-                    className="p-3 border-2 border-black bg-neutral-50 shadow-sm"
+                    className={`p-3 border-2 border-black shadow-sm ${
+                      match.player1.isUser || match.player2.isUser
+                        ? 'bg-[#ffe500] shadow-brutal-black'
+                        : 'bg-neutral-50'
+                    }`}
                   >
                     <div className="flex items-center justify-between font-mono text-xs font-bold py-1">
-                      <span className="text-neutral-900">
-                        {match.player1.name}
+                      <span className={match.player1.isUser ? 'text-black font-black underline' : 'text-neutral-900'}>
+                        {match.player1.avatar} {match.player1.name}
                       </span>
                       <span className="font-black text-black tabular-nums border border-black bg-white px-1.5">
                         {match.score[0]}
@@ -294,8 +310,8 @@ export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
                     </div>
                     <div className="border-t border-black/20 my-1" />
                     <div className="flex items-center justify-between font-mono text-xs font-bold py-1">
-                      <span className="text-neutral-900">
-                        {match.player2.name}
+                      <span className={match.player2.isUser ? 'text-black font-black underline' : 'text-neutral-900'}>
+                        {match.player2.avatar} {match.player2.name}
                       </span>
                       <span className="font-black text-black tabular-nums border border-black bg-white px-1.5">
                         {match.score[1]}
@@ -322,10 +338,12 @@ export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
                     <div className="font-mono text-xs font-black uppercase tracking-widest text-black mb-3">
                       {selectedTourney.trophyName}
                     </div>
-                    <div className="flex items-center justify-between font-broadcast text-lg sm:text-xl font-black italic text-black border-2 border-black bg-white p-2">
-                      <span>{match.player1.name}</span>
-                      <span className="bg-[#ffe500] px-1 border border-black">VS</span>
-                      <span>{match.player2.name}</span>
+                    <div className="flex items-center justify-between font-broadcast text-lg sm:text-xl font-black italic text-black border-2 border-black bg-white p-2 gap-2">
+                      <span className="truncate">{match.player1.name}</span>
+                      <span className="bg-[#ffe500] px-1 border border-black shrink-0">
+                        {match.status === 'COMPLETED' ? `${match.score[0]}:${match.score[1]}` : 'VS'}
+                      </span>
+                      <span className="truncate">{match.player2.name}</span>
                     </div>
                   </div>
                 ))}

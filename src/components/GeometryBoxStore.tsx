@@ -49,9 +49,10 @@ export const GeometryBoxStore: React.FC<GeometryBoxStoreProps> = ({
         pen: committedDrop.pen,
         skin: committedDrop.skin,
       });
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : '';
       const msg =
-        err?.message === 'INSUFFICIENT_CLIPS'
+        errMsg === 'INSUFFICIENT_CLIPS'
           ? `Insufficient Paperclips! Need ${box.costPaperclips} clips to unseal ${box.name}.`
           : 'Transaction rejected while verifying Paperclip balance. Please try again.';
       setErrorMessage(msg);
@@ -121,15 +122,6 @@ export const GeometryBoxStore: React.FC<GeometryBoxStoreProps> = ({
                   src={box.imagePath}
                   alt={box.name}
                   referrerPolicy="no-referrer"
-                  onError={(e) => {
-                    const target = e.currentTarget;
-                    const fname = box.imagePath.split('/').pop() || '';
-                    if (!target.src.includes('/images/' + fname)) {
-                      target.src = `/images/${fname}`;
-                    } else if (!target.src.includes('/src/assets/images/' + fname)) {
-                      target.src = `/src/assets/images/${fname}`;
-                    }
-                  }}
                   className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                 />
                 <div className="absolute top-2 right-2 px-2 py-0.5 bg-[#ffe500] text-black font-mono text-[10px] font-black uppercase tracking-wider border-2 border-black shadow-sm">

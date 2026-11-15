@@ -11,29 +11,23 @@ import {
   signOut,
   onAuthStateChanged,
 } from 'firebase/auth';
-import {
-  doc,
-  getDoc,
-  runTransaction,
-  serverTimestamp,
-  Timestamp,
-} from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, updateDoc, serverTimestamp } from 'firebase/firestore';
 import { auth, db } from './config';
-import { handleFirestoreError, OperationType } from './errors';
-import { PenDefinition, PenSkin, PlayerProfile } from '../types/game';
-import {
-  ADMIN_EMAIL,
-  ALL_PEN_IDS,
-  ALL_SKIN_IDS,
-  ALL_FLICK_STYLE_IDS,
-  GEOMETRY_BOXES,
-} from '../data/initialData';
+import { MatchMode, PenDefinition, PenSkin, PlayerProfile } from '../types/game';
 import { detectDevicePlatform } from '../utils/device';
 import {
+  CosmeticPrefsCache,
   DEFAULT_STARTER_PROFILE,
-  rollGeometryBoxDrop,
   sanitizeProfileInvariants,
 } from '../utils/storage';
+
+export type AdminGrantAction =
+  | 'MAX_ALL'
+  | 'ADD_CLIPS'
+  | 'UNLOCK_PENS'
+  | 'UNLOCK_SKINS'
+  | 'UNLOCK_STYLES'
+  | 'RESET_ROOKIE';
 
 interface AuthContextType {
   user: FirebaseUser | null;
@@ -44,548 +38,420 @@ interface AuthContextType {
   setGodModePower: (power: number) => void;
   signInWithGoogle: () => Promise<void>;
   signOutUser: () => Promise<void>;
-  updateProfileData: (updater: (prev: PlayerProfile) => PlayerProfile) => Promise<void>;
+  updateCosmeticPrefs: (patch: Partial<CosmeticPrefsCache>) => Promise<void>;
+  submitMatchResult: (
+    mode: MatchMode,
+    isVictory: boolean,
+    settlementToken?: string
+  ) => Promise<void>;
   purchaseGeometryBox: (boxId: string) => Promise<{ pen: PenDefinition; skin: PenSkin }>;
   claimTutorialReward: () => Promise<boolean>;
+  runAdminGrantAction: (action: AdminGrantAction, amount?: number) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
-const isVerifiedAdminAccount = (firebaseUser: FirebaseUser | null): boolean =>
-  Boolean(
-    firebaseUser &&
-      firebaseUser.emailVerified &&
-      firebaseUser.email?.toLowerCase().trim() === ADMIN_EMAIL.toLowerCase().trim()
-  );
-
-const getLocalProfile = (uid: string, allowAdmin: boolean): PlayerProfile | null => {
-  try {
-    const raw = localStorage.getItem(`pfa27_profile_${uid}`);
-    if (raw) {
-      return sanitizeProfileInvariants({ ...DEFAULT_STARTER_PROFILE, ...JSON.parse(raw) }, allowAdmin);
-    }
-  } catch (err) {
-    console.warn('Error reading local profile cache:', err);
-  }
-  return null;
-};
-
-const saveLocalProfile = (uid: string, p: PlayerProfile, allowAdmin: boolean) => {
-  try {
-    const clean = sanitizeProfileInvariants(p, allowAdmin);
-    localStorage.setItem(`pfa27_profile_${uid}`, JSON.stringify(clean));
-  } catch (err) {
-    console.warn('Error persisting local profile cache:', err);
-  }
-};
-
-const getAdminProfile = (): PlayerProfile => ({
-  username: 'Admin Developer (Sam)',
-  level: 99,
-  xp: 999999,
-  xpNextLevel: 1000000,
-  paperclips: 999999,
-  division: 1,
-  divisionPoints: 100,
-  totalWins: 777,
-  totalMatches: 777,
-  winStreak: 777,
-  equippedPenId: 'rotring_600',
-  equippedSkinId: 'skin_rotring_gold',
-  equippedFlickStyleId: 'style_knuckle_cannon',
-  unlockedPens: [...ALL_PEN_IDS],
-  unlockedSkins: [...ALL_SKIN_IDS],
-  unlockedFlickStyles: [...ALL_FLICK_STYLE_IDS],
-  role: 'ADMIN',
-  isAdmin: true,
-  platform: detectDevicePlatform(),
-  crossplaySetting: 'CROSSPLAY_ENABLED',
-  tutorialCompleted: true,
-});
-
-function buildUserDocPayload(
-  uid: string,
-  email: string,
-  p: PlayerProfile,
-  allowAdmin: boolean,
-  createdAtValue: unknown
-) {
-  const clean = sanitizeProfileInvariants(p, allowAdmin);
-  return {
-    userId: uid,
-    email: (email || `${uid}@pfa27.local`).slice(0, 256),
-    username: clean.username,
-    level: clean.level,
-    xp: clean.xp,
-    xpNextLevel: clean.xpNextLevel,
-    paperclips: clean.paperclips,
-    division: clean.division,
-    divisionPoints: clean.divisionPoints,
-    totalWins: clean.totalWins,
-    totalMatches: clean.totalMatches,
-    winStreak: clean.winStreak,
-    equippedPenId: clean.equippedPenId,
-    equippedSkinId: clean.equippedSkinId,
-    equippedFlickStyleId: clean.equippedFlickStyleId,
-    unlockedPens: clean.unlockedPens,
-    unlockedSkins: clean.unlockedSkins,
-    unlockedFlickStyles: clean.unlockedFlickStyles,
-    role: allowAdmin ? 'ADMIN' : 'PLAYER',
-    isAdmin: allowAdmin,
-    platform: clean.platform || 'desktop',
-    crossplaySetting: clean.crossplaySetting || 'CROSSPLAY_ENABLED',
-    tutorialCompleted: Boolean(clean.tutorialCompleted),
-    createdAt: createdAtValue || serverTimestamp(),
-    updatedAt: serverTimestamp(),
-  };
+function getCosmeticsCacheKey(uid: string): string {
+  return `pfa27_cosmetics_${uid}`;
 }
 
-function buildLeaderboardPayload(uid: string, p: PlayerProfile, allowAdmin: boolean) {
-  const clean = sanitizeProfileInvariants(p, allowAdmin);
-  return {
-    userId: uid,
-    username: clean.username,
-    division: clean.division,
-    divisionPoints: clean.divisionPoints,
-    totalWins: clean.totalWins,
-    totalMatches: clean.totalMatches,
-    winStreak: clean.winStreak,
-    equippedPenId: clean.equippedPenId,
-    isAdmin: allowAdmin,
-    updatedAt: serverTimestamp(),
-  };
+function readCosmeticPrefsCache(uid: string): Partial<CosmeticPrefsCache> | null {
+  try {
+    const raw = localStorage.getItem(getCosmeticsCacheKey(uid));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<CosmeticPrefsCache>;
+    return {
+      username: typeof parsed.username === 'string' ? parsed.username.slice(0, 64) : undefined,
+      equippedPenId: typeof parsed.equippedPenId === 'string' ? parsed.equippedPenId : undefined,
+      equippedSkinId: typeof parsed.equippedSkinId === 'string' ? parsed.equippedSkinId : undefined,
+      equippedFlickStyleId:
+        typeof parsed.equippedFlickStyleId === 'string' ? parsed.equippedFlickStyleId : undefined,
+      platform: parsed.platform === 'mobile' ? 'mobile' : 'desktop',
+      crossplaySetting:
+        parsed.crossplaySetting === 'SAME_PLATFORM_ONLY'
+          ? 'SAME_PLATFORM_ONLY'
+          : 'CROSSPLAY_ENABLED',
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeCosmeticPrefsCache(uid: string, profile: PlayerProfile) {
+  try {
+    const cache: CosmeticPrefsCache = {
+      username: profile.username,
+      equippedPenId: profile.equippedPenId,
+      equippedSkinId: profile.equippedSkinId,
+      equippedFlickStyleId: profile.equippedFlickStyleId,
+      platform: profile.platform === 'mobile' ? 'mobile' : 'desktop',
+      crossplaySetting:
+        profile.crossplaySetting === 'SAME_PLATFORM_ONLY'
+          ? 'SAME_PLATFORM_ONLY'
+          : 'CROSSPLAY_ENABLED',
+    };
+    localStorage.setItem(getCosmeticsCacheKey(uid), JSON.stringify(cache));
+  } catch {}
 }
 
 function docDataToProfile(
-  data: Record<string, any>,
+  data: Record<string, unknown>,
   firebaseUser: FirebaseUser,
-  isTargetAdmin: boolean
+  hasAdminClaim: boolean
 ): PlayerProfile {
-  const isAdmin = isTargetAdmin;
   const rawProfile: PlayerProfile = {
     username:
-      data.username ||
-      firebaseUser.displayName ||
-      (isAdmin ? 'Admin Developer (Sam)' : 'DeskFighter'),
-    level: isAdmin ? Math.max(data.level || 1, 99) : data.level || 1,
-    xp: isAdmin ? Math.max(data.xp || 0, 999999) : data.xp || 0,
-    xpNextLevel: isAdmin ? 1000000 : data.xpNextLevel || 100,
-    paperclips: isAdmin ? Math.max(data.paperclips ?? 0, 999999) : data.paperclips ?? 240,
-    division: isAdmin ? 1 : data.division || 10,
-    divisionPoints: isAdmin ? 100 : data.divisionPoints || 0,
-    totalWins: isAdmin ? Math.max(data.totalWins || 0, 777) : data.totalWins || 0,
-    totalMatches: isAdmin ? Math.max(data.totalMatches || 0, 777) : data.totalMatches || 0,
-    winStreak: isAdmin ? Math.max(data.winStreak || 0, 777) : data.winStreak || 0,
-    equippedPenId: data.equippedPenId || (isAdmin ? 'rotring_600' : 'bic_cristal'),
-    equippedSkinId: data.equippedSkinId || (isAdmin ? 'skin_rotring_gold' : 'skin_bic_classic_blue'),
+      typeof data.username === 'string' && data.username.trim()
+        ? data.username
+        : firebaseUser.displayName || 'DeskStriker27',
+    level: Number(data.level) || 1,
+    xp: Number(data.xp) || 0,
+    xpNextLevel: Number(data.xpNextLevel) || 100,
+    paperclips: data.paperclips !== undefined ? Number(data.paperclips) : 240,
+    division: Number(data.division) || 10,
+    divisionPoints: data.divisionPoints !== undefined ? Number(data.divisionPoints) : 20,
+    totalWins: Number(data.totalWins) || 0,
+    totalMatches: Number(data.totalMatches) || 0,
+    winStreak: Number(data.winStreak) || 0,
+    equippedPenId: typeof data.equippedPenId === 'string' ? data.equippedPenId : 'bic_cristal',
+    equippedSkinId:
+      typeof data.equippedSkinId === 'string' ? data.equippedSkinId : 'skin_bic_classic_blue',
     equippedFlickStyleId:
-      data.equippedFlickStyleId || (isAdmin ? 'style_knuckle_cannon' : 'style_classic_thumb'),
-    unlockedPens: isAdmin
-      ? [...ALL_PEN_IDS]
-      : Array.isArray(data.unlockedPens)
-        ? data.unlockedPens
-        : ['bic_cristal', 'pilot_g2'],
-    unlockedSkins: isAdmin
-      ? [...ALL_SKIN_IDS]
-      : Array.isArray(data.unlockedSkins)
-        ? data.unlockedSkins
-        : ['skin_bic_classic_blue', 'skin_g2_midnight'],
-    unlockedFlickStyles: isAdmin
-      ? [...ALL_FLICK_STYLE_IDS]
-      : Array.isArray(data.unlockedFlickStyles)
-        ? data.unlockedFlickStyles
-        : ['style_classic_thumb'],
-    role: isAdmin ? 'ADMIN' : 'PLAYER',
-    isAdmin,
-    platform: data.platform || detectDevicePlatform(),
-    crossplaySetting: data.crossplaySetting || 'CROSSPLAY_ENABLED',
-    tutorialCompleted: Boolean(data.tutorialCompleted ?? isAdmin),
+      typeof data.equippedFlickStyleId === 'string'
+        ? data.equippedFlickStyleId
+        : 'style_classic_thumb',
+    unlockedPens: Array.isArray(data.unlockedPens)
+      ? (data.unlockedPens as string[])
+      : ['bic_cristal', 'pilot_g2'],
+    unlockedSkins: Array.isArray(data.unlockedSkins)
+      ? (data.unlockedSkins as string[])
+      : ['skin_bic_classic_blue', 'skin_g2_midnight'],
+    unlockedFlickStyles: Array.isArray(data.unlockedFlickStyles)
+      ? (data.unlockedFlickStyles as string[])
+      : ['style_classic_thumb'],
+    role: hasAdminClaim ? 'ADMIN' : 'PLAYER',
+    isAdmin: hasAdminClaim,
+    platform: data.platform === 'mobile' ? 'mobile' : detectDevicePlatform(),
+    crossplaySetting:
+      data.crossplaySetting === 'SAME_PLATFORM_ONLY'
+        ? 'SAME_PLATFORM_ONLY'
+        : 'CROSSPLAY_ENABLED',
+    tutorialCompleted: Boolean(data.tutorialCompleted),
   };
-  return sanitizeProfileInvariants(rawProfile, isAdmin);
-}
 
-function isOfflineOrUnavailableError(err: any): boolean {
-  const code = String(err?.code || '').toLowerCase();
-  const msg = String(err?.message || '').toLowerCase();
-  return (
-    code === 'unavailable' ||
-    code === 'failed-precondition' ||
-    msg.includes('offline') ||
-    msg.includes('unavailable') ||
-    msg.includes('network')
-  );
+  return sanitizeProfileInvariants(rawProfile, hasAdminClaim);
 }
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<FirebaseUser | null>(null);
   const [profile, setProfile] = useState<PlayerProfile | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
+  const [isAdminUser, setIsAdminUser] = useState<boolean>(false);
   const [godModePower, setGodModePowerState] = useState<number>(1.0);
 
-  const profileRef = useRef<PlayerProfile | null>(null);
   const userRef = useRef<FirebaseUser | null>(null);
-  const createdAtRef = useRef<Timestamp | null>(null);
-  const updateQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const profileRef = useRef<PlayerProfile | null>(null);
+  const isAdminRef = useRef<boolean>(false);
 
-  const setSyncedProfile = useCallback((next: PlayerProfile | null) => {
-    profileRef.current = next;
-    setProfile(next);
-  }, []);
+  const setSyncedProfile = useCallback(
+    (next: PlayerProfile | null, uid?: string) => {
+      profileRef.current = next;
+      setProfile(next);
+      if (next && uid) {
+        writeCosmeticPrefsCache(uid, next);
+      }
+    },
+    []
+  );
 
-  const isAdminUser = isVerifiedAdminAccount(user);
-
-  // Strict enforcement: reset God Mode to 1.0x immediately whenever session is not a verified admin
+  // Enforce God Mode reset when user is not an admin via ID token custom claim
   useEffect(() => {
     if (!isAdminUser && godModePower !== 1.0) {
       setGodModePowerState(1.0);
     }
   }, [isAdminUser, godModePower]);
 
-  const setGodModePower = useCallback(
-    (power: number) => {
-      if (!isVerifiedAdminAccount(userRef.current)) {
-        setGodModePowerState(1.0);
-        return;
-      }
-      const clamped = Math.min(5.0, Math.max(1.0, Number(power) || 1.0));
-      setGodModePowerState(clamped);
-    },
-    []
-  );
+  const setGodModePower = useCallback((power: number) => {
+    if (!isAdminRef.current) {
+      setGodModePowerState(1.0);
+      return;
+    }
+    const clamped = Math.min(5.0, Math.max(1.0, Number(power) || 1.0));
+    setGodModePowerState(clamped);
+  }, []);
 
-  // Sync with Firestore profile + public PII-free leaderboard projection
-  const loadOrCreateUserProfile = useCallback(
+  const authorizedPost = useCallback(async <T,>(url: string, body: Record<string, unknown>): Promise<T> => {
+    const activeUser = userRef.current;
+    if (!activeUser) {
+      throw new Error('Not authenticated.');
+    }
+    const token = await activeUser.getIdToken();
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!res.ok) {
+      const errorCode = typeof data.error === 'string' ? data.error : `HTTP_${res.status}`;
+      throw new Error(errorCode);
+    }
+    return data as T;
+  }, []);
+
+  const bootstrapUserSession = useCallback(
     async (firebaseUser: FirebaseUser) => {
-      const userDocRef = doc(db, 'users', firebaseUser.uid);
-      const leaderboardDocRef = doc(db, 'leaderboard', firebaseUser.uid);
-      const isTargetAdmin = isVerifiedAdminAccount(firebaseUser);
-
-      // 1. Hydrate sanitized local cache immediately so UI renders smoothly
-      const cached = getLocalProfile(firebaseUser.uid, isTargetAdmin);
-      let activeProfile: PlayerProfile;
-
-      if (cached) {
-        activeProfile = isTargetAdmin
-          ? {
-              ...cached,
-              ...getAdminProfile(),
-              username: cached.username || 'Admin Developer (Sam)',
-            }
-          : cached;
-      } else if (isTargetAdmin) {
-        activeProfile = getAdminProfile();
-      } else {
-        activeProfile = sanitizeProfileInvariants(
-          {
-            ...DEFAULT_STARTER_PROFILE,
-            username: firebaseUser.displayName || 'DeskStriker27',
-            platform: detectDevicePlatform(),
-          },
-          false
-        );
+      // Strictly check custom claim `admin === true` on ID token (never email or cached flag)
+      let hasAdminClaim = false;
+      try {
+        const tokenResult = await firebaseUser.getIdTokenResult();
+        hasAdminClaim = tokenResult.claims.admin === true;
+      } catch {
+        hasAdminClaim = false;
       }
 
-      setSyncedProfile(activeProfile);
-      saveLocalProfile(firebaseUser.uid, activeProfile, isTargetAdmin);
+      isAdminRef.current = hasAdminClaim;
+      setIsAdminUser(hasAdminClaim);
 
-      // 2. Fetch authoritative cloud profile & ensure /leaderboard projection exists atomically
+      // Seed ONLY non-authoritative cosmetic UI fields until server profile loads
+      const cosmeticCache = readCosmeticPrefsCache(firebaseUser.uid);
+      const placeholderProfile = sanitizeProfileInvariants(
+        {
+          ...DEFAULT_STARTER_PROFILE,
+          username: cosmeticCache?.username || firebaseUser.displayName || 'DeskStriker27',
+          equippedPenId: cosmeticCache?.equippedPenId || DEFAULT_STARTER_PROFILE.equippedPenId,
+          equippedSkinId: cosmeticCache?.equippedSkinId || DEFAULT_STARTER_PROFILE.equippedSkinId,
+          equippedFlickStyleId:
+            cosmeticCache?.equippedFlickStyleId || DEFAULT_STARTER_PROFILE.equippedFlickStyleId,
+          platform: cosmeticCache?.platform || detectDevicePlatform(),
+          crossplaySetting: cosmeticCache?.crossplaySetting || 'CROSSPLAY_ENABLED',
+          role: hasAdminClaim ? 'ADMIN' : 'PLAYER',
+          isAdmin: hasAdminClaim,
+        },
+        hasAdminClaim
+      );
+      setSyncedProfile(placeholderProfile);
+
       try {
-        await runTransaction(db, async (tx) => {
-          const userSnap = await tx.get(userDocRef);
-          const lbSnap = await tx.get(leaderboardDocRef);
-
-          if (userSnap.exists()) {
-            const data = userSnap.data();
-            if (data.createdAt) {
-              createdAtRef.current = data.createdAt;
-            }
-            const loadedProfile = docDataToProfile(data, firebaseUser, isTargetAdmin);
-            activeProfile = loadedProfile;
-
-            const needsAdminSync =
-              isTargetAdmin &&
-              (!data.isAdmin ||
-                (data.paperclips ?? 0) < 999999 ||
-                (data.unlockedPens?.length || 0) < ALL_PEN_IDS.length);
-            const needsSchemaMigration =
-              data.tutorialCompleted === undefined ||
-              data.createdAt === undefined ||
-              data.crossplaySetting === undefined ||
-              data.platform === undefined;
-
-            if (needsAdminSync || needsSchemaMigration) {
-              tx.set(
-                userDocRef,
-                buildUserDocPayload(
-                  firebaseUser.uid,
-                  firebaseUser.email || '',
-                  loadedProfile,
-                  isTargetAdmin,
-                  data.createdAt || serverTimestamp()
-                )
-              );
-            }
-
-            if (!lbSnap.exists() || needsAdminSync || lbSnap.data()?.username !== loadedProfile.username) {
-              tx.set(
-                leaderboardDocRef,
-                buildLeaderboardPayload(firebaseUser.uid, loadedProfile, isTargetAdmin)
-              );
-            }
-          } else {
-            const initialProfile: PlayerProfile = isTargetAdmin
-              ? getAdminProfile()
-              : sanitizeProfileInvariants(
-                  {
-                    ...DEFAULT_STARTER_PROFILE,
-                    username: firebaseUser.displayName || 'DeskStriker27',
-                    platform: detectDevicePlatform(),
-                  },
-                  false
-                );
-            activeProfile = initialProfile;
-
-            tx.set(
-              userDocRef,
-              buildUserDocPayload(
-                firebaseUser.uid,
-                firebaseUser.email || '',
-                initialProfile,
-                isTargetAdmin,
-                serverTimestamp()
-              )
-            );
-            tx.set(
-              leaderboardDocRef,
-              buildLeaderboardPayload(firebaseUser.uid, initialProfile, isTargetAdmin)
-            );
-          }
+        const response = await authorizedPost<{ profile: PlayerProfile }>('/api/profile/me', {
+          platform: detectDevicePlatform(),
         });
-
-        setSyncedProfile(activeProfile);
-        saveLocalProfile(firebaseUser.uid, activeProfile, isTargetAdmin);
-      } catch (err: any) {
-        if (isOfflineOrUnavailableError(err)) {
-          console.warn('Firestore offline or auth token pending, using sanitized local profile.');
-          return;
-        }
-        // Fallback read to inspect existing doc safely if transaction couldn't run
+        const cleanServerProfile = sanitizeProfileInvariants(response.profile, hasAdminClaim);
+        setSyncedProfile(cleanServerProfile, firebaseUser.uid);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('Backend /api/profile/me fallback to Firestore starter read:', msg);
+        // If Admin SDK env isn't configured yet, ensure starter doc exists cleanly via Firestore
         try {
-          const snap = await getDoc(userDocRef);
-          if (snap.exists()) {
-            const data = snap.data();
-            if (data.createdAt) createdAtRef.current = data.createdAt;
-            const loaded = docDataToProfile(data, firebaseUser, isTargetAdmin);
-            setSyncedProfile(loaded);
-            saveLocalProfile(firebaseUser.uid, loaded, isTargetAdmin);
-          }
-        } catch (readErr: any) {
-          if (!isOfflineOrUnavailableError(readErr)) {
-            console.warn('Cloud profile sync deferred:', readErr?.message || readErr);
-          }
+          const userDocRef = doc(db, 'users', firebaseUser.uid);
+          const starterPayload = {
+            userId: firebaseUser.uid,
+            email: (firebaseUser.email || `${firebaseUser.uid}@pfa27.local`).slice(0, 256),
+            username: placeholderProfile.username,
+            level: 1,
+            xp: 0,
+            xpNextLevel: 100,
+            paperclips: 240,
+            division: 10,
+            divisionPoints: 20,
+            totalWins: 0,
+            totalMatches: 0,
+            winStreak: 0,
+            equippedPenId: 'bic_cristal',
+            equippedSkinId: 'skin_bic_classic_blue',
+            equippedFlickStyleId: 'style_classic_thumb',
+            unlockedPens: ['bic_cristal', 'pilot_g2'],
+            unlockedSkins: ['skin_bic_classic_blue', 'skin_g2_midnight'],
+            unlockedFlickStyles: ['style_classic_thumb'],
+            role: 'PLAYER',
+            isAdmin: false,
+            platform: detectDevicePlatform(),
+            crossplaySetting: 'CROSSPLAY_ENABLED',
+            tutorialCompleted: false,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          };
+          await setDoc(userDocRef, starterPayload, { merge: false });
+        } catch {
+          // Existing document already present or offline; listener below will hydrate
         }
       }
     },
-    [setSyncedProfile]
+    [authorizedPost, setSyncedProfile]
   );
 
+  // Subscribe to Auth state + live Firestore user document snapshot
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+    let unsubscribeSnapshot: (() => void) | null = null;
+
+    const unsubscribeAuth = onAuthStateChanged(auth, async (currentUser) => {
+      if (unsubscribeSnapshot) {
+        unsubscribeSnapshot();
+        unsubscribeSnapshot = null;
+      }
+
       userRef.current = currentUser;
       setUser(currentUser);
-      createdAtRef.current = null;
+
+      if (!currentUser) {
+        isAdminRef.current = false;
+        setIsAdminUser(false);
+        setGodModePowerState(1.0);
+        setSyncedProfile(null);
+        setLoading(false);
+        return;
+      }
+
       try {
-        if (currentUser) {
-          await loadOrCreateUserProfile(currentUser);
-        } else {
-          setSyncedProfile(null);
-          setGodModePowerState(1.0);
-        }
+        await bootstrapUserSession(currentUser);
+
+        unsubscribeSnapshot = onSnapshot(
+          doc(db, 'users', currentUser.uid),
+          (snap) => {
+            if (snap.exists()) {
+              const cloudProfile = docDataToProfile(
+                snap.data() as Record<string, unknown>,
+                currentUser,
+                isAdminRef.current
+              );
+              setSyncedProfile(cloudProfile, currentUser.uid);
+            }
+          },
+          (err) => {
+            console.warn('Firestore profile listener notice:', err.message);
+          }
+        );
       } catch (err) {
-        console.warn('Auth state subscription error handled:', err);
+        console.warn('Auth bootstrap notice:', err);
       } finally {
         setLoading(false);
       }
     });
 
-    return () => unsubscribe();
-  }, [loadOrCreateUserProfile, setSyncedProfile]);
+    return () => {
+      if (unsubscribeSnapshot) unsubscribeSnapshot();
+      unsubscribeAuth();
+    };
+  }, [bootstrapUserSession, setSyncedProfile]);
 
   const signInWithGoogle = async () => {
-    try {
-      const provider = new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
-      if (result.user) {
-        userRef.current = result.user;
-        await loadOrCreateUserProfile(result.user);
-      }
-    } catch (err) {
-      console.error('Sign in failed:', err);
-      throw err;
+    const provider = new GoogleAuthProvider();
+    const result = await signInWithPopup(auth, provider);
+    if (result.user) {
+      userRef.current = result.user;
+      await bootstrapUserSession(result.user);
     }
   };
 
   const signOutUser = async () => {
-    try {
-      await signOut(auth);
-      userRef.current = null;
-      createdAtRef.current = null;
-      setUser(null);
-      setSyncedProfile(null);
-      setGodModePowerState(1.0);
-    } catch (err) {
-      console.error('Sign out failed:', err);
-    }
+    await signOut(auth);
+    userRef.current = null;
+    isAdminRef.current = false;
+    setIsAdminUser(false);
+    setUser(null);
+    setSyncedProfile(null);
+    setGodModePowerState(1.0);
   };
 
-  // Serialized, transaction-safe profile mutation + atomic leaderboard projection update
-  const enqueueTransaction = useCallback(
-    <T,>(
-      executor: (current: PlayerProfile, allowAdmin: boolean) => { nextProfile: PlayerProfile; result: T }
-    ): Promise<T> => {
-      const task = updateQueueRef.current.then(async (): Promise<T> => {
-        const activeUser = userRef.current;
-        const currentProfile = profileRef.current;
-        if (!activeUser || !currentProfile) {
-          throw new Error('Not authenticated.');
-        }
+  const updateCosmeticPrefs = useCallback(
+    async (patch: Partial<CosmeticPrefsCache>) => {
+      const activeUser = userRef.current;
+      const current = profileRef.current;
+      if (!activeUser || !current) return;
 
-        const allowAdmin = isVerifiedAdminAccount(activeUser);
-        const userDocRef = doc(db, 'users', activeUser.uid);
-        const leaderboardDocRef = doc(db, 'leaderboard', activeUser.uid);
+      const optimistic = sanitizeProfileInvariants({ ...current, ...patch }, isAdminRef.current);
+      setSyncedProfile(optimistic, activeUser.uid);
 
-        try {
-          let txOutcome!: { nextProfile: PlayerProfile; result: T };
-
-          await runTransaction(db, async (tx) => {
-            const snap = await tx.get(userDocRef);
-            const authoritativeBase = snap.exists()
-              ? docDataToProfile(snap.data(), activeUser, allowAdmin)
-              : sanitizeProfileInvariants(currentProfile, allowAdmin);
-            const existingCreatedAt = snap.exists()
-              ? snap.data().createdAt || createdAtRef.current || serverTimestamp()
-              : serverTimestamp();
-
-            if (snap.exists() && snap.data().createdAt) {
-              createdAtRef.current = snap.data().createdAt;
-            }
-
-            txOutcome = executor(authoritativeBase, allowAdmin);
-            const cleanNext = sanitizeProfileInvariants(txOutcome.nextProfile, allowAdmin);
-            txOutcome.nextProfile = cleanNext;
-
-            tx.set(
-              userDocRef,
-              buildUserDocPayload(
-                activeUser.uid,
-                activeUser.email || '',
-                cleanNext,
-                allowAdmin,
-                existingCreatedAt
-              )
-            );
-            tx.set(
-              leaderboardDocRef,
-              buildLeaderboardPayload(activeUser.uid, cleanNext, allowAdmin)
-            );
-          });
-
-          setSyncedProfile(txOutcome.nextProfile);
-          saveLocalProfile(activeUser.uid, txOutcome.nextProfile, allowAdmin);
-          return txOutcome.result;
-        } catch (err: any) {
-          if (err?.message === 'INSUFFICIENT_CLIPS') {
-            throw err;
-          }
-          if (isOfflineOrUnavailableError(err)) {
-            const outcome = executor(
-              sanitizeProfileInvariants(currentProfile, allowAdmin),
-              allowAdmin
-            );
-            const cleanNext = sanitizeProfileInvariants(outcome.nextProfile, allowAdmin);
-            setSyncedProfile(cleanNext);
-            saveLocalProfile(activeUser.uid, cleanNext, allowAdmin);
-            return outcome.result;
-          }
-          handleFirestoreError(err, OperationType.WRITE, `users/${activeUser.uid}`);
-        }
-      });
-
-      updateQueueRef.current = task.catch(() => undefined);
-      return task;
-    },
-    [setSyncedProfile]
-  );
-
-  const updateProfileData = useCallback(
-    async (updater: (prev: PlayerProfile) => PlayerProfile) => {
-      if (!userRef.current || !profileRef.current) return;
       try {
-        await enqueueTransaction((current, allowAdmin) => ({
-          nextProfile: sanitizeProfileInvariants(updater(current), allowAdmin),
-          result: undefined,
-        }));
-      } catch (err) {
-        console.warn('Profile update failed validation or permission check:', err);
+        const res = await authorizedPost<{ profile: PlayerProfile }>('/api/profile/cosmetics', patch);
+        setSyncedProfile(
+          sanitizeProfileInvariants(res.profile, isAdminRef.current),
+          activeUser.uid
+        );
+      } catch {
+        // Fallback to direct client Firestore cosmetic-only update (permitted by rules)
+        try {
+          const allowedPatch: Record<string, unknown> = { updatedAt: serverTimestamp() };
+          if (patch.username !== undefined) allowedPatch.username = optimistic.username;
+          if (patch.equippedPenId !== undefined) allowedPatch.equippedPenId = optimistic.equippedPenId;
+          if (patch.equippedSkinId !== undefined) allowedPatch.equippedSkinId = optimistic.equippedSkinId;
+          if (patch.equippedFlickStyleId !== undefined) {
+            allowedPatch.equippedFlickStyleId = optimistic.equippedFlickStyleId;
+          }
+          if (patch.platform !== undefined) allowedPatch.platform = optimistic.platform;
+          if (patch.crossplaySetting !== undefined) {
+            allowedPatch.crossplaySetting = optimistic.crossplaySetting;
+          }
+          await updateDoc(doc(db, 'users', activeUser.uid), allowedPatch);
+        } catch (err) {
+          console.warn('Cosmetic preference update failed:', err);
+        }
       }
     },
-    [enqueueTransaction]
+    [authorizedPost, setSyncedProfile]
+  );
+
+  const submitMatchResult = useCallback(
+    async (mode: MatchMode, isVictory: boolean, settlementToken?: string) => {
+      const activeUser = userRef.current;
+      if (!activeUser) return;
+
+      const res = await authorizedPost<{ profile: PlayerProfile }>('/api/economy/match-result', {
+        mode,
+        isVictory,
+        settlementToken,
+      });
+      setSyncedProfile(sanitizeProfileInvariants(res.profile, isAdminRef.current), activeUser.uid);
+    },
+    [authorizedPost, setSyncedProfile]
   );
 
   const purchaseGeometryBox = useCallback(
     async (boxId: string): Promise<{ pen: PenDefinition; skin: PenSkin }> => {
-      const box = GEOMETRY_BOXES.find((b) => b.id === boxId);
-      if (!box) {
-        throw new Error('INVALID_BOX');
+      const activeUser = userRef.current;
+      if (!activeUser) {
+        throw new Error('Not authenticated.');
       }
+      const res = await authorizedPost<{
+        profile: PlayerProfile;
+        pen: PenDefinition;
+        skin: PenSkin;
+      }>('/api/economy/purchase-box', { boxId });
 
-      return enqueueTransaction((current) => {
-        if (current.paperclips < box.costPaperclips) {
-          throw new Error('INSUFFICIENT_CLIPS');
-        }
-
-        const drop = rollGeometryBoxDrop(box.id);
-        const nextPens = current.unlockedPens.includes(drop.pen.id)
-          ? [...current.unlockedPens]
-          : [...current.unlockedPens, drop.pen.id];
-        const nextSkins = current.unlockedSkins.includes(drop.skin.id)
-          ? [...current.unlockedSkins]
-          : [...current.unlockedSkins, drop.skin.id];
-
-        return {
-          nextProfile: {
-            ...current,
-            paperclips: Math.max(0, current.paperclips - box.costPaperclips),
-            unlockedPens: nextPens,
-            unlockedSkins: nextSkins,
-          },
-          result: { pen: drop.pen, skin: drop.skin },
-        };
-      });
+      setSyncedProfile(sanitizeProfileInvariants(res.profile, isAdminRef.current), activeUser.uid);
+      return { pen: res.pen, skin: res.skin };
     },
-    [enqueueTransaction]
+    [authorizedPost, setSyncedProfile]
   );
 
   const claimTutorialReward = useCallback(async (): Promise<boolean> => {
-    if (!userRef.current || !profileRef.current) return false;
-    return enqueueTransaction((current) => {
-      if (current.tutorialCompleted) {
-        return { nextProfile: current, result: false };
+    const activeUser = userRef.current;
+    if (!activeUser) return false;
+    const res = await authorizedPost<{ profile: PlayerProfile; newlyClaimed: boolean }>(
+      '/api/economy/tutorial-complete',
+      {}
+    );
+    setSyncedProfile(sanitizeProfileInvariants(res.profile, isAdminRef.current), activeUser.uid);
+    return res.newlyClaimed;
+  }, [authorizedPost, setSyncedProfile]);
+
+  const runAdminGrantAction = useCallback(
+    async (action: AdminGrantAction, amount?: number) => {
+      const activeUser = userRef.current;
+      if (!activeUser || !isAdminRef.current) {
+        throw new Error('Forbidden: admin claim required.');
       }
-      const nextSkins = current.unlockedSkins.includes('skin_gold_leaf')
-        ? [...current.unlockedSkins]
-        : [...current.unlockedSkins, 'skin_gold_leaf'];
-      return {
-        nextProfile: {
-          ...current,
-          tutorialCompleted: true,
-          paperclips: Math.min(999999, current.paperclips + 100),
-          unlockedSkins: nextSkins,
-        },
-        result: true,
-      };
-    });
-  }, [enqueueTransaction]);
+      const res = await authorizedPost<{ profile: PlayerProfile }>('/api/admin/grant', {
+        action,
+        amount,
+      });
+      setSyncedProfile(sanitizeProfileInvariants(res.profile, isAdminRef.current), activeUser.uid);
+    },
+    [authorizedPost, setSyncedProfile]
+  );
 
   return (
     <AuthContext.Provider
@@ -598,9 +464,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setGodModePower,
         signInWithGoogle,
         signOutUser,
-        updateProfileData,
+        updateCosmeticPrefs,
+        submitMatchResult,
         purchaseGeometryBox,
         claimTutorialReward,
+        runAdminGrantAction,
       }}
     >
       {children}
