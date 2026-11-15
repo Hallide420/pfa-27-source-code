@@ -705,6 +705,7 @@ export const TutorialAcademy: React.FC<TutorialAcademyProps> = ({
 
   // Graduation Claim
   const handleGraduateAcademy = () => {
+    if (hasClaimedReward) return;
     sounds.playPaperclipReward();
     triggerHaptic('heavy');
     setHasClaimedReward(true);
@@ -1102,7 +1103,9 @@ export const TutorialAcademy: React.FC<TutorialAcademyProps> = ({
                       onClick={handleGraduateAcademy}
                       className="w-full py-3.5 bg-emerald-400 hover:bg-emerald-300 text-black font-broadcast font-black text-lg uppercase tracking-wider border-2 border-black cursor-pointer shadow-brutal-white active:scale-95 transition-all"
                     >
-                      CLAIM REWARD & ENTER THE ARENA
+                      {profile.tutorialCompleted
+                        ? 'GRADUATION REWARD ALREADY CLAIMED — RETURN TO ARENA'
+                        : 'CLAIM REWARD & ENTER THE ARENA'}
                     </button>
                   ) : (
                     <div className="p-3 bg-emerald-500/20 text-emerald-300 border border-emerald-500 font-mono text-xs font-bold uppercase">

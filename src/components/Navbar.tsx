@@ -166,7 +166,7 @@ export const Navbar: React.FC<NavbarProps> = ({
         </button>
 
         {/* Developer Admin Status Badge / Modal Trigger */}
-        {(isAdminUser || profile.isAdmin || profile.role === 'ADMIN') && (
+        {isAdminUser && (
           <button
             onClick={() => {
               sounds.playClick();

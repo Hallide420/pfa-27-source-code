@@ -11,11 +11,13 @@ import { Trophy, Lock, Unlock, Play, AlertCircle } from 'lucide-react';
 
 interface TournamentBracketViewProps {
   profile: PlayerProfile;
+  isAdminUser?: boolean;
   onStartTournamentMatch: (tournament: Tournament, match: TournamentMatch) => void;
 }
 
 export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
   profile,
+  isAdminUser = false,
   onStartTournamentMatch,
 }) => {
   const [tournaments] = useState<Tournament[]>(() => {
@@ -148,7 +150,7 @@ export const TournamentBracketView: React.FC<TournamentBracketViewProps> = ({
             </button>
           </div>
 
-          {(profile.isAdmin || profile.role === 'ADMIN') && (
+          {isAdminUser && (
             <button
               onClick={() => {
                 sounds.playPaperclipReward();

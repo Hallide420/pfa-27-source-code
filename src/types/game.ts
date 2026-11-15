@@ -198,3 +198,31 @@ export interface TutorialLesson {
   coachingTip: string;
   targetTask: string;
 }
+
+export interface OnlinePenSnapshot {
+  id: string;
+  pos: Vector2D;
+  vel: Vector2D;
+  angle: number;
+  angularVel: number;
+  isKnockedOut: boolean;
+}
+
+export interface OnlineMatchSyncState {
+  pens: OnlinePenSnapshot[];
+  activeTurn: 'player1' | 'player2';
+  roundScore: [number, number];
+  currentRound: number;
+  turnSeq: number;
+  matchWinner?: 'player1' | 'player2' | null;
+}
+
+export interface OnlineFlickPayload {
+  power: number;
+  angle: number;
+  curve: number;
+  styleId: string;
+  actor: 'player1' | 'player2';
+  turnSeq: number;
+}
+

@@ -4,7 +4,7 @@
  */
 
 import React, { useState } from 'react';
-import { GeometryBox, PlayerProfile } from '../types/game';
+import { GeometryBox, PenDefinition, PenSkin, PlayerProfile } from '../types/game';
 import { GEOMETRY_BOXES } from '../data/initialData';
 import { PackOpeningModal } from './PackOpeningModal';
 import { sounds } from '../utils/audio';
@@ -12,30 +12,53 @@ import { Sparkles, HelpCircle } from 'lucide-react';
 
 interface GeometryBoxStoreProps {
   profile: PlayerProfile;
-  onDeductClips: (amount: number) => void;
-  onItemUnlocked: (itemType: 'pen' | 'skin', itemId: string) => void;
+  onPurchaseBox: (boxId: string) => Promise<{ pen: PenDefinition; skin: PenSkin }>;
   onEquipNow: (penId: string, skinId: string) => void;
 }
 
 export const GeometryBoxStore: React.FC<GeometryBoxStoreProps> = ({
   profile,
-  onDeductClips,
-  onItemUnlocked,
+  onPurchaseBox,
   onEquipNow,
 }) => {
-  const [activeBoxToOpen, setActiveBoxToOpen] = useState<GeometryBox | null>(null);
+  const [activePackSession, setActivePackSession] = useState<{
+    box: GeometryBox;
+    pen: PenDefinition;
+    skin: PenSkin;
+  } | null>(null);
+  const [isPurchasingBoxId, setIsPurchasingBoxId] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  const handlePurchase = (box: GeometryBox) => {
+  const handlePurchase = async (box: GeometryBox) => {
+    if (isPurchasingBoxId || activePackSession) return;
     sounds.playClick();
+
     if (profile.paperclips < box.costPaperclips) {
-      setErrorMessage(`Insufficient Paperclips! Win matches to earn ${box.costPaperclips - profile.paperclips} more clips.`);
+      setErrorMessage(
+        `Insufficient Paperclips! Win matches to earn ${box.costPaperclips - profile.paperclips} more clips.`
+      );
       setTimeout(() => setErrorMessage(null), 3500);
       return;
     }
 
-    onDeductClips(box.costPaperclips);
-    setActiveBoxToOpen(box);
+    setIsPurchasingBoxId(box.id);
+    try {
+      const committedDrop = await onPurchaseBox(box.id);
+      setActivePackSession({
+        box,
+        pen: committedDrop.pen,
+        skin: committedDrop.skin,
+      });
+    } catch (err: any) {
+      const msg =
+        err?.message === 'INSUFFICIENT_CLIPS'
+          ? `Insufficient Paperclips! Need ${box.costPaperclips} clips to unseal ${box.name}.`
+          : 'Transaction rejected while verifying Paperclip balance. Please try again.';
+      setErrorMessage(msg);
+      setTimeout(() => setErrorMessage(null), 3500);
+    } finally {
+      setIsPurchasingBoxId(null);
+    }
   };
 
   return (
@@ -85,6 +108,7 @@ export const GeometryBoxStore: React.FC<GeometryBoxStoreProps> = ({
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-6">
         {GEOMETRY_BOXES.map((box) => {
           const canAfford = profile.paperclips >= box.costPaperclips;
+          const isBusy = isPurchasingBoxId === box.id;
 
           return (
             <div
@@ -131,11 +155,20 @@ export const GeometryBoxStore: React.FC<GeometryBoxStoreProps> = ({
                     <div className="flex items-center justify-between text-xs font-bold">
                       <span className="text-neutral-800">Rare+ Tier</span>
                       <span className="text-black tabular-nums">
-                        {Math.round((box.dropRates.Rare + box.dropRates.Epic + box.dropRates.Legendary + box.dropRates.Icon) * 100)}%
+                        {Math.round(
+                          (box.dropRates.Rare +
+                            box.dropRates.Epic +
+                            box.dropRates.Legendary +
+                            box.dropRates.Icon) *
+                            100
+                        )}
+                        %
                       </span>
                     </div>
                     <div className="flex items-center justify-between text-xs font-bold">
-                      <span className="text-black bg-[#ffe500] px-1 border border-black">Legendary / Icon</span>
+                      <span className="text-black bg-[#ffe500] px-1 border border-black">
+                        Legendary / Icon
+                      </span>
                       <span className="text-black tabular-nums font-black">
                         {Math.round((box.dropRates.Legendary + box.dropRates.Icon) * 100)}%
                       </span>
@@ -146,14 +179,19 @@ export const GeometryBoxStore: React.FC<GeometryBoxStoreProps> = ({
                 {/* Purchase Button */}
                 <button
                   onClick={() => handlePurchase(box)}
-                  className={`mt-5 w-full flex items-center justify-center gap-2 py-3 border-2 border-black font-broadcast font-black text-lg uppercase tracking-wider transition-all cursor-pointer ${
-                    canAfford
-                      ? 'bg-[#ffe500] hover:bg-[#f2d700] text-black shadow-brutal-black hover:translate-x-0.5 hover:translate-y-0.5'
-                      : 'bg-neutral-200 text-neutral-500 cursor-not-allowed'
+                  disabled={Boolean(isPurchasingBoxId) || !canAfford}
+                  className={`mt-5 w-full flex items-center justify-center gap-2 py-3 border-2 border-black font-broadcast font-black text-lg uppercase tracking-wider transition-all ${
+                    isBusy
+                      ? 'bg-neutral-300 text-black cursor-wait'
+                      : canAfford
+                        ? 'bg-[#ffe500] hover:bg-[#f2d700] text-black shadow-brutal-black hover:translate-x-0.5 hover:translate-y-0.5 cursor-pointer'
+                        : 'bg-neutral-200 text-neutral-500 cursor-not-allowed'
                   }`}
                 >
                   <Sparkles className="w-4 h-4" />
-                  <span>CRACK OPEN ({box.costPaperclips} CLIPS)</span>
+                  <span>
+                    {isBusy ? 'VERIFYING...' : `CRACK OPEN (${box.costPaperclips} CLIPS)`}
+                  </span>
                 </button>
               </div>
             </div>
@@ -162,11 +200,12 @@ export const GeometryBoxStore: React.FC<GeometryBoxStoreProps> = ({
       </div>
 
       {/* Pack Opening Modal */}
-      {activeBoxToOpen && (
+      {activePackSession && (
         <PackOpeningModal
-          box={activeBoxToOpen}
-          onClose={() => setActiveBoxToOpen(null)}
-          onItemUnlocked={onItemUnlocked}
+          box={activePackSession.box}
+          committedPen={activePackSession.pen}
+          committedSkin={activePackSession.skin}
+          onClose={() => setActivePackSession(null)}
           onEquipNow={onEquipNow}
         />
       )}

@@ -3,89 +3,50 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import confetti from 'canvas-confetti';
 import { GeometryBox, PenDefinition, PenSkin, Rarity } from '../types/game';
-import { PENS_CATALOG } from '../data/initialData';
 import { sounds } from '../utils/audio';
 import { Sparkles, Check, ArrowRight } from 'lucide-react';
 
 interface PackOpeningModalProps {
   box: GeometryBox;
+  committedPen: PenDefinition;
+  committedSkin: PenSkin;
   onClose: () => void;
-  onItemUnlocked: (itemType: 'pen' | 'skin', itemId: string) => void;
   onEquipNow: (penId: string, skinId: string) => void;
 }
 
 export const PackOpeningModal: React.FC<PackOpeningModalProps> = ({
   box,
+  committedPen,
+  committedSkin,
   onClose,
-  onItemUnlocked,
   onEquipNow,
 }) => {
   const [phase, setPhase] = useState<'BOX_CLOSED' | 'OPENING' | 'WALKOUT_REVEAL'>('BOX_CLOSED');
-  const [unlockedItem, setUnlockedItem] = useState<{
-    pen: PenDefinition;
-    skin: PenSkin;
-    rarity: Rarity;
-  } | null>(null);
 
-  useEffect(() => {
-    const rand = Math.random();
-    let selectedRarity: Rarity = 'Common';
-    const rates = box.dropRates;
-
-    if (rand < rates.Icon) {
-      selectedRarity = 'Icon';
-    } else if (rand < rates.Icon + rates.Legendary) {
-      selectedRarity = 'Legendary';
-    } else if (rand < rates.Icon + rates.Legendary + rates.Epic) {
-      selectedRarity = 'Epic';
-    } else if (rand < rates.Icon + rates.Legendary + rates.Epic + rates.Rare) {
-      selectedRarity = 'Rare';
-    } else {
-      selectedRarity = 'Common';
-    }
-
-    const allSkins: { pen: PenDefinition; skin: PenSkin }[] = [];
-    for (const pen of PENS_CATALOG) {
-      for (const skin of pen.availableSkins) {
-        if (skin.rarity === selectedRarity) {
-          allSkins.push({ pen, skin });
-        }
-      }
-    }
-
-    const fallbackPen = PENS_CATALOG[0];
-    const drop = allSkins.length > 0
-      ? allSkins[Math.floor(Math.random() * allSkins.length)]
-      : { pen: fallbackPen, skin: fallbackPen.availableSkins[0] };
-
-    setUnlockedItem({
-      pen: drop.pen,
-      skin: drop.skin,
-      rarity: drop.skin.rarity,
-    });
-  }, [box]);
+  const unlockedItem = {
+    pen: committedPen,
+    skin: committedSkin,
+    rarity: committedSkin.rarity,
+  };
 
   const handleOpenBox = () => {
+    if (phase !== 'BOX_CLOSED') return;
     setPhase('OPENING');
     sounds.playDeskImpact(0.8);
 
     setTimeout(() => {
       setPhase('WALKOUT_REVEAL');
-      if (unlockedItem) {
-        sounds.playPackOpening(unlockedItem.rarity);
-        onItemUnlocked('skin', unlockedItem.skin.id);
-        onItemUnlocked('pen', unlockedItem.pen.id);
+      sounds.playPackOpening(unlockedItem.rarity);
 
-        confetti({
-          particleCount: unlockedItem.rarity === 'Icon' ? 140 : 80,
-          spread: 80,
-          origin: { y: 0.6 },
-          colors: ['#ffe500', '#000000', '#ffffff', '#38bdf8'],
-        });
-      }
+      confetti({
+        particleCount: unlockedItem.rarity === 'Icon' ? 140 : 80,
+        spread: 80,
+        origin: { y: 0.6 },
+        colors: ['#ffe500', '#000000', '#ffffff', '#38bdf8'],
+      });
     }, 1200);
   };
 
@@ -167,7 +128,7 @@ export const PackOpeningModal: React.FC<PackOpeningModalProps> = ({
         )}
 
         {/* Phase 3: Walkout Card Reveal */}
-        {phase === 'WALKOUT_REVEAL' && unlockedItem && (
+        {phase === 'WALKOUT_REVEAL' && (
           <div className="flex flex-col items-center w-full animate-fadeIn">
             <span
               className={`font-mono text-xs uppercase tracking-widest px-3 py-1 mb-4 ${getRarityBadge(

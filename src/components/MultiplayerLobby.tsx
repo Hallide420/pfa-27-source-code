@@ -9,8 +9,8 @@ import { DIVISIONS, PENS_CATALOG } from '../data/initialData';
 import { sounds } from '../utils/audio';
 import { Wifi, Copy, Check, ArrowRight, Globe, Smartphone, Laptop, RefreshCw, ShieldAlert, UserCheck, Bot } from 'lucide-react';
 import { triggerHaptic, detectDevicePlatform } from '../utils/device';
-import { collection, getDocs } from 'firebase/firestore';
-import { db } from '../firebase/config';
+import { collection, getDocs, limit, orderBy, query } from 'firebase/firestore';
+import { auth, db } from '../firebase/config';
 
 interface PublicRoomItem {
   code: string;
@@ -27,6 +27,9 @@ interface MultiplayerLobbyProps {
   crossplaySetting?: 'CROSSPLAY_ENABLED' | 'SAME_PLATFORM_ONLY';
   onToggleCrossplay?: () => void;
   platform?: 'mobile' | 'desktop';
+  serverRoomCode?: string | null;
+  roomError?: string | null;
+  onClearError?: () => void;
 }
 
 export const MultiplayerLobby: React.FC<MultiplayerLobbyProps> = ({
@@ -36,14 +39,23 @@ export const MultiplayerLobby: React.FC<MultiplayerLobbyProps> = ({
   crossplaySetting = 'CROSSPLAY_ENABLED',
   onToggleCrossplay,
   platform = detectDevicePlatform(),
+  serverRoomCode,
+  roomError,
+  onClearError,
 }) => {
   const [roomCodeInput, setRoomCodeInput] = useState<string>('');
-  const [createdRoomCode, setCreatedRoomCode] = useState<string | null>(null);
+  const [createdRoomCode, setCreatedRoomCode] = useState<string | null>(serverRoomCode || null);
   const [isCopied, setIsCopied] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<'ROOMS' | 'RANKINGS'>('ROOMS');
   const [, setConnectionStatus] = useState<'CONNECTING' | 'CONNECTED' | 'OFFLINE'>('CONNECTING');
   const [publicRooms, setPublicRooms] = useState<PublicRoomItem[]>([]);
   const [isLoadingRooms, setIsLoadingRooms] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (serverRoomCode) {
+      setCreatedRoomCode(serverRoomCode);
+    }
+  }, [serverRoomCode]);
 
   const fetchRooms = () => {
     setIsLoadingRooms(true);
@@ -69,6 +81,7 @@ export const MultiplayerLobby: React.FC<MultiplayerLobbyProps> = ({
 
   const handleCreateRoom = () => {
     sounds.playClick();
+    onClearError?.();
     const newCode = Math.random().toString(36).substring(2, 7).toUpperCase();
     setCreatedRoomCode(newCode);
     onJoinRoom(newCode, true);
@@ -76,9 +89,27 @@ export const MultiplayerLobby: React.FC<MultiplayerLobbyProps> = ({
 
   const handleJoinWithCode = () => {
     sounds.playClick();
+    onClearError?.();
     const code = roomCodeInput.trim().toUpperCase();
     if (code.length >= 4) {
       onJoinRoom(code, false);
+    }
+  };
+
+  const handleQuickQueue = () => {
+    sounds.playClick();
+    onClearError?.();
+    const myCrossplay = crossplaySetting === 'CROSSPLAY_ENABLED';
+    const matchRoom = publicRooms.find((r) => {
+      if (!r.crossplay && r.hostPlatform !== platform) return false;
+      if (!myCrossplay && r.hostPlatform !== platform) return false;
+      return true;
+    });
+    if (matchRoom) {
+      onJoinRoom(matchRoom.code, false);
+    } else {
+      handleCreateRoom();
+      onStartRankedMatch();
     }
   };
 
@@ -111,14 +142,23 @@ export const MultiplayerLobby: React.FC<MultiplayerLobbyProps> = ({
     const loadRealHumanRankings = async () => {
       setIsLoadingLeaderboard(true);
       try {
-        const usersSnap = await getDocs(collection(db, 'users'));
-        if (!usersSnap.empty) {
+        const lbQuery = query(
+          collection(db, 'leaderboard'),
+          orderBy('division', 'asc'),
+          limit(50)
+        );
+        const lbSnap = await getDocs(lbQuery);
+        if (!lbSnap.empty) {
+          const currentUid = auth.currentUser?.uid;
           const list: LeaderboardPlayer[] = [];
-          usersSnap.forEach((docSnap) => {
+          lbSnap.forEach((docSnap) => {
             const data = docSnap.data();
             const penDef =
               PENS_CATALOG.find((p) => p.id === data.equippedPenId) || PENS_CATALOG[0];
-            const isUser = data.userId === profile.username || data.username === profile.username;
+            const isUser = Boolean(
+              (currentUid && (docSnap.id === currentUid || data.userId === currentUid)) ||
+              data.username === profile.username
+            );
             const pts =
               (10 - (data.division || 10)) * 250 +
               (data.divisionPoints || 0) +
@@ -135,7 +175,7 @@ export const MultiplayerLobby: React.FC<MultiplayerLobbyProps> = ({
               penName: penDef.name,
               badge: data.isAdmin ? '👑' : data.division === 1 ? '🥇' : data.division <= 3 ? '🥈' : '🎮',
               isCurrentUser: isUser,
-              isAdmin: Boolean(data.isAdmin || data.role === 'ADMIN'),
+              isAdmin: Boolean(data.isAdmin),
               totalWins: data.totalWins || 0,
               winStreak: data.winStreak || 0,
             });
@@ -367,11 +407,22 @@ export const MultiplayerLobby: React.FC<MultiplayerLobbyProps> = ({
                 </div>
               </div>
 
+              {roomError && (
+                <div className="mb-3 p-3 bg-red-100 border-2 border-red-600 text-red-900 font-mono text-xs font-bold flex items-center justify-between gap-2">
+                  <span>{roomError}</span>
+                  {onClearError && (
+                    <button
+                      onClick={onClearError}
+                      className="px-2 py-0.5 bg-red-600 text-white text-[10px] font-black uppercase cursor-pointer"
+                    >
+                      DISMISS
+                    </button>
+                  )}
+                </div>
+              )}
+
               <button
-                onClick={() => {
-                  sounds.playClick();
-                  onStartRankedMatch();
-                }}
+                onClick={handleQuickQueue}
                 className="w-full flex items-center justify-center gap-2 py-4 bg-[#ffe500] hover:bg-[#f2d700] text-black font-broadcast font-black text-xl uppercase tracking-wider border-3 border-black shadow-brutal-black hover:translate-x-0.5 hover:translate-y-0.5 transition-all cursor-pointer active:scale-95"
               >
                 SEARCH RANKED OPPONENT

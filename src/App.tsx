@@ -3,9 +3,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useRef } from 'react';
-import { GameView, PlayerProfile, Tournament, TournamentMatch, BotDifficulty, MatchMode } from './types/game';
-import { awardMatchWin, unlockItemInProfile } from './utils/storage';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  GameView,
+  PlayerProfile,
+  Tournament,
+  TournamentMatch,
+  BotDifficulty,
+  MatchMode,
+  OnlineFlickPayload,
+  OnlineMatchSyncState,
+} from './types/game';
+import { awardMatchWin } from './utils/storage';
 import { sounds } from './utils/audio';
 import { BOT_DIFFICULTIES } from './data/initialData';
 import { AuthProvider, useAuth } from './firebase/AuthContext';
@@ -25,7 +34,17 @@ import { NewsView } from './components/NewsView';
 import { detectDevicePlatform } from './utils/device';
 
 function MainAppContent() {
-  const { user, profile, loading, signOutUser, updateProfileData, isAdminUser, godModePower } = useAuth();
+  const {
+    user,
+    profile,
+    loading,
+    signOutUser,
+    updateProfileData,
+    purchaseGeometryBox,
+    claimTutorialReward,
+    isAdminUser,
+    godModePower,
+  } = useAuth();
   const [currentView, setCurrentView] = useState<GameView>('HUB');
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [isAdminModalOpen, setIsAdminModalOpen] = useState<boolean>(false);
@@ -54,57 +73,349 @@ function MainAppContent() {
 
   // Online WebSocket state
   const wsRef = useRef<WebSocket | null>(null);
-  const [incomingOnlineFlick, setIncomingOnlineFlick] = useState<{
-    power: number;
-    angle: number;
-    curve: number;
-    styleId: string;
-  } | null>(null);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptsRef = useRef<number>(0);
+  const intentionalCloseRef = useRef<boolean>(false);
+  const onlineSessionRef = useRef<{ roomCode: string; sessionToken: string } | null>(null);
+  const turnSeqRef = useRef<number>(0);
+
+  const [incomingOnlineFlick, setIncomingOnlineFlick] = useState<OnlineFlickPayload | null>(null);
+  const [onlineSyncSnapshot, setOnlineSyncSnapshot] = useState<OnlineMatchSyncState | null>(null);
+  const [onlineTurnSeq, setOnlineTurnSeq] = useState<number>(0);
+  const [onlineRole, setOnlineRole] = useState<'player1' | 'player2'>('player1');
+  const [activeOpponentPenId, setActiveOpponentPenId] = useState<string | undefined>(undefined);
   const [onlineRoomCode, setOnlineRoomCode] = useState<string | null>(null);
+  const [roomError, setRoomError] = useState<string | null>(null);
+  const [onlineConnectionStatus, setOnlineConnectionStatus] = useState<'CONNECTED' | 'RECONNECTING' | 'DISCONNECTED'>('CONNECTED');
+  const [opponentConnectionStatus, setOpponentConnectionStatus] = useState<'ONLINE' | 'RECONNECTING' | 'LEFT'>('ONLINE');
+  const [opponentGraceSeconds, setOpponentGraceSeconds] = useState<number>(30);
+  const [onlineNotice, setOnlineNotice] = useState<string | null>(null);
+  const [forfeitWinner, setForfeitWinner] = useState<'player1' | 'player2' | null>(null);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
+  const [rematchState, setRematchState] = useState<{
+    requestedByMe: boolean;
+    requestedByOpponent: boolean;
+    triggerCounter: number;
+  }>({ requestedByMe: false, requestedByOpponent: false, triggerCounter: 0 });
 
-  // Handle WebSocket connection
-  const initWebSocket = () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) return wsRef.current;
+  const saveOnlineSession = (roomCode: string, sessionToken: string) => {
+    onlineSessionRef.current = { roomCode, sessionToken };
+    try {
+      sessionStorage.setItem('pfa27_online_session', JSON.stringify({ roomCode, sessionToken }));
+    } catch {}
+  };
 
+  const clearOnlineSession = () => {
+    onlineSessionRef.current = null;
+    try {
+      sessionStorage.removeItem('pfa27_online_session');
+    } catch {}
+  };
+
+  // Grace period countdown UI ticker
+  useEffect(() => {
+    if (opponentConnectionStatus !== 'RECONNECTING') return;
+    const timer = setInterval(() => {
+      setOpponentGraceSeconds((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [opponentConnectionStatus]);
+
+  // Periodic latency ping while in an active online room
+  useEffect(() => {
+    if (matchMode !== 'ONLINE_ROOM' || currentView !== 'MATCH') return;
+    const pingInterval = setInterval(() => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'PING', ts: Date.now() }));
+      }
+    }, 5000);
+    return () => clearInterval(pingInterval);
+  }, [matchMode, currentView]);
+
+  // Handle WebSocket connection + auto-reconnect
+  const initWebSocket = useCallback((isReconnectAttempt: boolean = false) => {
+    if (
+      !isReconnectAttempt &&
+      wsRef.current &&
+      (wsRef.current.readyState === WebSocket.OPEN || wsRef.current.readyState === WebSocket.CONNECTING)
+    ) {
+      return wsRef.current;
+    }
+
+    if (wsRef.current && wsRef.current.readyState !== WebSocket.CLOSED) {
+      intentionalCloseRef.current = true;
+      wsRef.current.close();
+    }
+
+    intentionalCloseRef.current = false;
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}`;
     const socket = new WebSocket(wsUrl);
 
     socket.onopen = () => {
-      console.log('PFA 27 Live WebSocket connected');
+      reconnectAttemptsRef.current = 0;
+      setOnlineConnectionStatus('CONNECTED');
+      socket.send(JSON.stringify({ type: 'PING', ts: Date.now() }));
+
+      if (isReconnectAttempt && onlineSessionRef.current) {
+        socket.send(
+          JSON.stringify({
+            type: 'RECONNECT_ROOM',
+            roomCode: onlineSessionRef.current.roomCode,
+            sessionToken: onlineSessionRef.current.sessionToken,
+          })
+        );
+      }
     };
 
     socket.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
-        if (msg.type === 'OPPONENT_JOINED') {
-          setActiveOpponentName(msg.opponentName || 'Online Rival');
-          setActiveOpponentAvatar('⚡');
-          if (msg.opponentPlatform) setActiveOpponentPlatform(msg.opponentPlatform);
-          setMatchMode('ONLINE_ROOM');
-          setCurrentView('MATCH');
-        } else if (msg.type === 'ROOM_JOINED') {
-          setActiveOpponentName(msg.opponentName || 'Room Host');
-          setActiveOpponentAvatar('👑');
-          if (msg.opponentPlatform) setActiveOpponentPlatform(msg.opponentPlatform);
-          setMatchMode('ONLINE_ROOM');
-          setCurrentView('MATCH');
-        } else if (msg.type === 'OPPONENT_FLICKED') {
-          setIncomingOnlineFlick({
-            power: msg.power,
-            angle: msg.angle,
-            curve: msg.curve,
-            styleId: msg.flickStyleId,
-          });
+
+        switch (msg.type) {
+          case 'PING': {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: 'PONG', ts: msg.ts }));
+            }
+            break;
+          }
+
+          case 'PONG': {
+            if (typeof msg.ts === 'number') {
+              setLatencyMs(Math.max(1, Date.now() - msg.ts));
+            }
+            break;
+          }
+
+          case 'RTT_UPDATE': {
+            if (typeof msg.rttMs === 'number') {
+              setLatencyMs(Math.max(1, msg.rttMs));
+            }
+            break;
+          }
+
+          case 'ROOM_CREATED': {
+            setOnlineRoomCode(msg.roomCode);
+            setOnlineRole('player1');
+            setRoomError(null);
+            if (msg.sessionToken) {
+              saveOnlineSession(msg.roomCode, msg.sessionToken);
+            }
+            break;
+          }
+
+          case 'OPPONENT_JOINED': {
+            turnSeqRef.current = msg.turnSeq ?? 0;
+            setOnlineTurnSeq(turnSeqRef.current);
+            setOnlineRole('player1');
+            setActiveOpponentName(msg.opponentName || 'Online Rival');
+            setActiveOpponentAvatar('⚡');
+            setActiveOpponentPenId(msg.opponentPen);
+            if (msg.opponentPlatform) setActiveOpponentPlatform(msg.opponentPlatform);
+            setOpponentConnectionStatus('ONLINE');
+            setForfeitWinner(null);
+            setOnlineSyncSnapshot(null);
+            setIncomingOnlineFlick(null);
+            setOnlineNotice(null);
+            setRematchState({ requestedByMe: false, requestedByOpponent: false, triggerCounter: 0 });
+            setMatchMode('ONLINE_ROOM');
+            setCurrentView('MATCH');
+            break;
+          }
+
+          case 'ROOM_JOINED': {
+            turnSeqRef.current = msg.turnSeq ?? 0;
+            setOnlineTurnSeq(turnSeqRef.current);
+            setOnlineRole('player2');
+            setOnlineRoomCode(msg.roomCode);
+            if (msg.sessionToken) {
+              saveOnlineSession(msg.roomCode, msg.sessionToken);
+            }
+            setActiveOpponentName(msg.opponentName || 'Room Host');
+            setActiveOpponentAvatar('👑');
+            setActiveOpponentPenId(msg.opponentPen);
+            if (msg.opponentPlatform) setActiveOpponentPlatform(msg.opponentPlatform);
+            setOpponentConnectionStatus('ONLINE');
+            setForfeitWinner(null);
+            setOnlineSyncSnapshot(null);
+            setIncomingOnlineFlick(null);
+            setOnlineNotice(null);
+            setRematchState({ requestedByMe: false, requestedByOpponent: false, triggerCounter: 0 });
+            setMatchMode('ONLINE_ROOM');
+            setCurrentView('MATCH');
+            break;
+          }
+
+          case 'ROOM_RECONNECTED': {
+            turnSeqRef.current = msg.turnSeq ?? 0;
+            setOnlineTurnSeq(turnSeqRef.current);
+            setOnlineRole(msg.role === 'player2' ? 'player2' : 'player1');
+            setOnlineRoomCode(msg.roomCode);
+            setActiveOpponentName(msg.opponentName || 'Online Rival');
+            setActiveOpponentPenId(msg.opponentPen);
+            if (msg.opponentPlatform) setActiveOpponentPlatform(msg.opponentPlatform);
+            setOpponentConnectionStatus(msg.opponentConnected ? 'ONLINE' : 'RECONNECTING');
+            setOnlineNotice('Reconnected cleanly to live desk.');
+            setTimeout(() => setOnlineNotice(null), 3000);
+            if (msg.snapshot) {
+              setOnlineSyncSnapshot(msg.snapshot);
+            }
+            setMatchMode('ONLINE_ROOM');
+            setCurrentView('MATCH');
+            break;
+          }
+
+          case 'RECONNECT_FAILED': {
+            clearOnlineSession();
+            setOnlineConnectionStatus('DISCONNECTED');
+            setRoomError(msg.message || 'Session expired.');
+            setCurrentView('MULTIPLAYER');
+            break;
+          }
+
+          case 'FLICK_ACCEPTED': {
+            if (typeof msg.turnSeq === 'number') {
+              turnSeqRef.current = msg.turnSeq;
+              setOnlineTurnSeq(msg.turnSeq);
+            }
+            break;
+          }
+
+          case 'ACTION_REJECTED': {
+            setOnlineNotice(msg.message || 'Action rejected by server.');
+            setTimeout(() => setOnlineNotice(null), 2500);
+            if (typeof msg.turnSeq === 'number') {
+              turnSeqRef.current = msg.turnSeq;
+              setOnlineTurnSeq(msg.turnSeq);
+            }
+            if (msg.snapshot) {
+              setOnlineSyncSnapshot(msg.snapshot);
+            }
+            break;
+          }
+
+          case 'OPPONENT_FLICKED': {
+            if (typeof msg.turnSeq === 'number') {
+              turnSeqRef.current = msg.turnSeq;
+              setOnlineTurnSeq(msg.turnSeq);
+            }
+            setIncomingOnlineFlick({
+              power: msg.power,
+              angle: msg.angle,
+              curve: msg.curve,
+              styleId: msg.flickStyleId,
+              actor: msg.actor === 'player1' ? 'player1' : 'player2',
+              turnSeq: msg.turnSeq ?? turnSeqRef.current,
+            });
+            break;
+          }
+
+          case 'PEER_STATE_SYNC': {
+            if (typeof msg.turnSeq === 'number') {
+              turnSeqRef.current = msg.turnSeq;
+              setOnlineTurnSeq(msg.turnSeq);
+            }
+            setOnlineSyncSnapshot({
+              pens: msg.pens || [],
+              activeTurn: msg.activeTurn === 'player2' ? 'player2' : 'player1',
+              roundScore: msg.roundScore || [0, 0],
+              currentRound: msg.currentRound || 1,
+              turnSeq: msg.turnSeq ?? turnSeqRef.current,
+              matchWinner: msg.matchWinner || null,
+            });
+            break;
+          }
+
+          case 'OPPONENT_DISCONNECTED_TEMP': {
+            setOpponentConnectionStatus('RECONNECTING');
+            setOpponentGraceSeconds(msg.graceSeconds || 30);
+            setOnlineNotice(msg.message || 'Opponent lost connection...');
+            break;
+          }
+
+          case 'OPPONENT_RECONNECTED': {
+            setOpponentConnectionStatus('ONLINE');
+            setOnlineNotice(msg.message || 'Opponent reconnected!');
+            setTimeout(() => setOnlineNotice(null), 3000);
+            break;
+          }
+
+          case 'OPPONENT_FORFEITED':
+          case 'OPPONENT_LEFT': {
+            setOpponentConnectionStatus('LEFT');
+            setOnlineNotice(msg.message || 'Opponent left the match.');
+            if (msg.winner === 'player1' || msg.winner === 'player2') {
+              setForfeitWinner(msg.winner);
+            }
+            clearOnlineSession();
+            break;
+          }
+
+          case 'REMATCH_REQUESTED': {
+            setRematchState((prev) => ({ ...prev, requestedByOpponent: true }));
+            break;
+          }
+
+          case 'REMATCH_STARTED': {
+            turnSeqRef.current = msg.turnSeq ?? 0;
+            setOnlineTurnSeq(turnSeqRef.current);
+            setOnlineSyncSnapshot(null);
+            setIncomingOnlineFlick(null);
+            setForfeitWinner(null);
+            setRematchState((prev) => ({
+              requestedByMe: false,
+              requestedByOpponent: false,
+              triggerCounter: prev.triggerCounter + 1,
+            }));
+            break;
+          }
+
+          case 'ERROR': {
+            setRoomError(msg.message || 'Room connection error.');
+            break;
+          }
+
+          default:
+            break;
         }
       } catch (e) {
         console.error('Socket message parse error', e);
       }
     };
 
+    socket.onclose = () => {
+      if (intentionalCloseRef.current) return;
+
+      // Auto-reconnect with exponential backoff if an active online session exists
+      if (onlineSessionRef.current && reconnectAttemptsRef.current < 5) {
+        setOnlineConnectionStatus('RECONNECTING');
+        const delayMs = Math.min(8000, 1000 * Math.pow(2, reconnectAttemptsRef.current));
+        reconnectAttemptsRef.current += 1;
+        reconnectTimerRef.current = setTimeout(() => {
+          initWebSocket(true);
+        }, delayMs);
+      } else {
+        setOnlineConnectionStatus('DISCONNECTED');
+      }
+    };
+
     wsRef.current = socket;
     return socket;
-  };
+  }, []);
+
+  // Attempt auto-recovery if user refreshed mid-match within grace window
+  useEffect(() => {
+    try {
+      const saved = sessionStorage.getItem('pfa27_online_session');
+      if (saved && profile && !onlineSessionRef.current) {
+        const parsed = JSON.parse(saved);
+        if (parsed?.roomCode && parsed?.sessionToken) {
+          onlineSessionRef.current = parsed;
+          initWebSocket(true);
+        }
+      }
+    } catch {}
+  }, [profile, initWebSocket]);
 
   const handleToggleMute = () => {
     const muted = sounds.toggleMute();
@@ -147,7 +458,8 @@ function MainAppContent() {
 
   const handleJoinOnlineRoom = (roomCode: string, isHost: boolean) => {
     if (!profile) return;
-    const socket = initWebSocket();
+    setRoomError(null);
+    const socket = initWebSocket(false);
     setOnlineRoomCode(roomCode);
 
     const checkAndSend = () => {
@@ -156,6 +468,7 @@ function MainAppContent() {
           socket.send(
             JSON.stringify({
               type: 'CREATE_ROOM',
+              roomCode,
               playerName: profile.username,
               penId: profile.equippedPenId,
               platform: currentPlatform,
@@ -174,46 +487,79 @@ function MainAppContent() {
             })
           );
         }
-      } else {
+      } else if (socket.readyState === WebSocket.CONNECTING) {
         setTimeout(checkAndSend, 100);
       }
     };
     checkAndSend();
   };
 
-  const handleSendFlickOnline = (power: number, angle: number, curve: number, styleId: string) => {
+  const handleSendFlickOnline = useCallback(
+    (power: number, angle: number, curve: number, styleId: string) => {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'FLICK_ACTION',
+            power,
+            angle,
+            curve,
+            flickStyleId: styleId,
+            turnSeq: turnSeqRef.current,
+          })
+        );
+      }
+    },
+    []
+  );
+
+  const handleSendSyncStateOnline = useCallback((snapshot: OnlineMatchSyncState) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
-          type: 'FLICK_ACTION',
-          power,
-          angle,
-          curve,
-          flickStyleId: styleId,
+          type: 'SYNC_STATE',
+          ...snapshot,
         })
       );
     }
+  }, []);
+
+  const handleRequestRematchOnline = useCallback(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      setRematchState((prev) => ({ ...prev, requestedByMe: true }));
+      wsRef.current.send(JSON.stringify({ type: 'REQUEST_REMATCH' }));
+    }
+  }, []);
+
+  const handleExitMatch = () => {
+    if (matchMode === 'ONLINE_ROOM') {
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'LEAVE_ROOM' }));
+      }
+      intentionalCloseRef.current = true;
+      wsRef.current?.close();
+      wsRef.current = null;
+      clearOnlineSession();
+      setOnlineRoomCode(null);
+      setForfeitWinner(null);
+      setOnlineSyncSnapshot(null);
+      setIncomingOnlineFlick(null);
+    }
+    setCurrentView('HUB');
   };
 
   const handleMatchComplete = (winner: 'player1' | 'player2') => {
     if (!profile) return;
     const isVictory = winner === 'player1';
+    const isRankedMatch = matchMode === 'ONLINE_ROOM' || matchMode === 'TOURNAMENT';
 
-    // Award XP and Paperclips, sync to cloud
+    // Award XP and Paperclips; strictly isolate Bot Lab and local Pass & Play from Ranked division ladder
     updateProfileData((prev) => {
-      if (matchMode === 'BOT_BATTLE') {
-        // Isolated practice mode: grants training paperclips & XP without altering division ladder points or leaderboard rank
-        return {
-          ...prev,
-          paperclips: isVictory ? prev.paperclips + 20 : prev.paperclips + 5,
-          xp: prev.xp + (isVictory ? 30 : 10),
-          totalMatches: prev.totalMatches + 1,
-        };
-      }
       const { updatedProfile } = awardMatchWin(
         prev,
         isVictory,
-        matchMode === 'TOURNAMENT' ? 80 : 35
+        matchMode === 'TOURNAMENT' ? 80 : matchMode === 'ONLINE_ROOM' ? 35 : 20,
+        isRankedMatch
       );
       return updatedProfile;
     });
@@ -238,17 +584,6 @@ function MainAppContent() {
     }
   };
 
-  const handleDeductClips = (amount: number) => {
-    updateProfileData((prev) => ({
-      ...prev,
-      paperclips: Math.max(0, prev.paperclips - amount),
-    }));
-  };
-
-  const handleItemUnlocked = (itemType: 'pen' | 'skin', itemId: string) => {
-    updateProfileData((prev) => unlockItemInProfile(prev, itemType, itemId));
-  };
-
   const handleEquipNow = (penId: string, skinId: string) => {
     updateProfileData((prev) => ({
       ...prev,
@@ -257,16 +592,15 @@ function MainAppContent() {
     }));
   };
 
-  const handleCompleteTutorial = () => {
-    updateProfileData((prev) => ({
-      ...prev,
-      tutorialCompleted: true,
-      paperclips: prev.paperclips + 100,
-      unlockedSkins: prev.unlockedSkins.includes('skin_gold_leaf')
-        ? prev.unlockedSkins
-        : [...prev.unlockedSkins, 'skin_gold_leaf'],
-    }));
-    sounds.levelUp();
+  const handleCompleteTutorial = async () => {
+    try {
+      const newlyClaimed = await claimTutorialReward();
+      if (newlyClaimed) {
+        sounds.levelUp();
+      }
+    } catch (err) {
+      console.warn('Tutorial graduation claim notice:', err);
+    }
     setCurrentView('HUB');
   };
 
@@ -315,6 +649,7 @@ function MainAppContent() {
         {currentView === 'HUB' && (
           <HubDashboard
             profile={profile}
+            isAdminUser={isAdminUser}
             onNavigate={(view) => setCurrentView(view)}
             onQuickRankedMatch={handleQuickRanked}
             onStartPassAndPlay={handleStartPassAndPlay}
@@ -330,14 +665,28 @@ function MainAppContent() {
             botPenId={activeBotPenId}
             opponentName={activeOpponentName}
             opponentAvatar={activeOpponentAvatar}
+            opponentPenId={activeOpponentPenId}
+            localRole={onlineRole}
             onMatchComplete={handleMatchComplete}
-            onExitMatch={() => setCurrentView('HUB')}
+            onExitMatch={handleExitMatch}
             onEquipPen={(penId) =>
               updateProfileData((p) => ({ ...p, equippedPenId: penId }))
             }
             onSendFlick={handleSendFlickOnline}
+            onSendSyncState={handleSendSyncStateOnline}
+            onRequestRematch={handleRequestRematchOnline}
             incomingOnlineFlick={incomingOnlineFlick}
-            godModePower={godModePower}
+            onlineSyncSnapshot={onlineSyncSnapshot}
+            onlineTurnSeq={onlineTurnSeq}
+            onlineConnectionStatus={onlineConnectionStatus}
+            opponentConnectionStatus={opponentConnectionStatus}
+            opponentGraceSeconds={opponentGraceSeconds}
+            onlineNotice={onlineNotice}
+            forfeitWinner={forfeitWinner}
+            latencyMs={latencyMs}
+            rematchState={rematchState}
+            isAdminUser={isAdminUser}
+            godModePower={isAdminUser ? godModePower : 1.0}
             playerPlatform={currentPlatform}
             opponentPlatform={activeOpponentPlatform}
             crossplay={crossplaySetting === 'CROSSPLAY_ENABLED'}
@@ -347,6 +696,7 @@ function MainAppContent() {
         {currentView === 'TOURNAMENT' && (
           <TournamentBracketView
             profile={profile}
+            isAdminUser={isAdminUser}
             onStartTournamentMatch={handleStartTournamentMatch}
           />
         )}
@@ -354,8 +704,7 @@ function MainAppContent() {
         {currentView === 'GEOMETRY_STORE' && (
           <GeometryBoxStore
             profile={profile}
-            onDeductClips={handleDeductClips}
-            onItemUnlocked={handleItemUnlocked}
+            onPurchaseBox={purchaseGeometryBox}
             onEquipNow={handleEquipNow}
           />
         )}
@@ -383,6 +732,9 @@ function MainAppContent() {
             crossplaySetting={crossplaySetting}
             onToggleCrossplay={handleToggleCrossplay}
             platform={currentPlatform}
+            serverRoomCode={onlineRoomCode}
+            roomError={roomError}
+            onClearError={() => setRoomError(null)}
           />
         )}
 
@@ -394,6 +746,9 @@ function MainAppContent() {
             crossplaySetting={crossplaySetting}
             onToggleCrossplay={handleToggleCrossplay}
             platform={currentPlatform}
+            serverRoomCode={onlineRoomCode}
+            roomError={roomError}
+            onClearError={() => setRoomError(null)}
           />
         )}
 
@@ -407,8 +762,9 @@ function MainAppContent() {
 
         {currentView === 'NEWS' && (
           <NewsView
-            isAdminUser={isAdminUser || profile.isAdmin || profile.role === 'ADMIN'}
+            isAdminUser={isAdminUser}
             userEmail={user.email || undefined}
+            userUid={user.uid}
             onNavigate={(view) => setCurrentView(view)}
           />
         )}
@@ -443,8 +799,8 @@ function MainAppContent() {
         platform={currentPlatform}
       />
 
-      {/* Admin Developer Console Modal */}
-      {isAdminModalOpen && (
+      {/* Admin Developer Console Modal (strictly verified admin only) */}
+      {isAdminModalOpen && isAdminUser && (
         <AdminPanelModal onClose={() => setIsAdminModalOpen(false)} />
       )}
 

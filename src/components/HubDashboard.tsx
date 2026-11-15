@@ -11,6 +11,7 @@ import { Play, Trophy, Package, Users, ArrowRight, Zap, Flame, Scale, Layers, Bo
 
 interface HubDashboardProps {
   profile: PlayerProfile;
+  isAdminUser?: boolean;
   onNavigate: (view: GameView) => void;
   onQuickRankedMatch: () => void;
   onStartPassAndPlay: () => void;
@@ -19,6 +20,7 @@ interface HubDashboardProps {
 
 export const HubDashboard: React.FC<HubDashboardProps> = ({
   profile,
+  isAdminUser = false,
   onNavigate,
   onQuickRankedMatch,
   onStartPassAndPlay,
@@ -387,7 +389,7 @@ export const HubDashboard: React.FC<HubDashboardProps> = ({
               <span className="bg-[#ffe500] text-black px-2 py-0.2 font-mono text-[10px] font-black uppercase">
                 DIV {profile.division}
               </span>
-              {(profile.isAdmin || profile.role === 'ADMIN') && (
+              {isAdminUser && (
                 <span className="bg-red-600 text-white px-2 py-0.2 font-mono text-[10px] font-black uppercase border border-white shadow-sm">
                   ADMIN [ROOT]
                 </span>

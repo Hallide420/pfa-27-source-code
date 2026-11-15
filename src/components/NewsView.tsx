@@ -20,13 +20,14 @@ import {
   Filter
 } from 'lucide-react';
 import { collection, query, orderBy, onSnapshot, addDoc, deleteDoc, doc, serverTimestamp } from 'firebase/firestore';
-import { db } from '../firebase/config';
+import { db, auth } from '../firebase/config';
 import { Announcement, GameView } from '../types/game';
 import { sounds } from '../utils/audio';
 
 interface NewsViewProps {
   isAdminUser?: boolean;
   userEmail?: string;
+  userUid?: string;
   onNavigate: (view: GameView) => void;
 }
 
@@ -86,6 +87,7 @@ const FALLBACK_ANNOUNCEMENTS: Announcement[] = [
 export const NewsView: React.FC<NewsViewProps> = ({
   isAdminUser = false,
   userEmail,
+  userUid,
   onNavigate,
 }) => {
   const [announcements, setAnnouncements] = useState<Announcement[]>(FALLBACK_ANNOUNCEMENTS);
@@ -94,6 +96,7 @@ export const NewsView: React.FC<NewsViewProps> = ({
   const [isPublishing, setIsPublishing] = useState(false);
   const [publishSuccess, setPublishSuccess] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   // Form states
   const [newTitle, setNewTitle] = useState('');
@@ -162,14 +165,21 @@ export const NewsView: React.FC<NewsViewProps> = ({
     setIsPublishing(true);
     setErrorMsg(null);
 
+    const resolvedUid = auth.currentUser?.uid || userUid;
+    if (!resolvedUid) {
+      setErrorMsg('You must be signed in to publish announcements.');
+      setIsPublishing(false);
+      return;
+    }
+
     try {
       await addDoc(collection(db, 'announcements'), {
-        title: newTitle.trim(),
-        content: newContent.trim(),
+        title: newTitle.trim().slice(0, 140),
+        content: newContent.trim().slice(0, 3000),
         category: newCategory,
         pinned: newPinned,
-        authorName: userEmail ? userEmail.split('@')[0] : 'Sam (Admin)',
-        authorUid: userEmail || 'admin',
+        authorName: (userEmail ? userEmail.split('@')[0] : 'Sam').slice(0, 64),
+        authorUid: resolvedUid,
         createdAt: serverTimestamp(),
       });
 
@@ -192,7 +202,11 @@ export const NewsView: React.FC<NewsViewProps> = ({
 
   const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!window.confirm('Are you sure you want to delete this announcement?')) return;
+    if (confirmDeleteId !== id) {
+      setConfirmDeleteId(id);
+      return;
+    }
+    setConfirmDeleteId(null);
     try {
       await deleteDoc(doc(db, 'announcements', id));
       sounds.flick();
@@ -410,14 +424,34 @@ export const NewsView: React.FC<NewsViewProps> = ({
                   {/* Admin Delete Action */}
                   {isAdminUser && (
                     <div className="flex items-center md:flex-col gap-2 shrink-0 self-end md:self-start">
-                      <button
-                        onClick={(e) => handleDelete(post.id, e)}
-                        title="Delete Announcement"
-                        className="p-2 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 transition text-xs flex items-center gap-1"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                        <span className="md:hidden">Delete</span>
-                      </button>
+                      {confirmDeleteId === post.id ? (
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={(e) => handleDelete(post.id, e)}
+                            className="px-2.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white font-black text-[10px] uppercase tracking-wider transition"
+                          >
+                            Confirm
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setConfirmDeleteId(null);
+                            }}
+                            className="px-2 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-bold uppercase transition"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={(e) => handleDelete(post.id, e)}
+                          title="Delete Announcement"
+                          className="p-2 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-400 border border-red-500/30 transition text-xs flex items-center gap-1"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                          <span className="md:hidden">Delete</span>
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>

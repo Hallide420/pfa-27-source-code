@@ -14,8 +14,10 @@ interface AdminPanelModalProps {
 }
 
 export const AdminPanelModal: React.FC<AdminPanelModalProps> = ({ onClose }) => {
-  const { user, profile, updateProfileData, godModePower, setGodModePower } = useAuth();
+  const { user, profile, isAdminUser, updateProfileData, godModePower, setGodModePower } = useAuth();
   const [feedbackMsg, setFeedbackMsg] = useState<string | null>(null);
+
+  if (!isAdminUser || !profile) return null;
 
   const showFeedback = (msg: string) => {
     setFeedbackMsg(msg);

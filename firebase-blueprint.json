@@ -2,27 +2,30 @@
   "entities": {
     "User": {
       "title": "User",
-      "description": "Authenticated player profile, inventory, and rankings in PFA 27",
+      "description": "Private authenticated player profile, wallet, inventory, and progression stats in PFA 27",
       "type": "object",
       "properties": {
         "userId": {
           "type": "string",
           "description": "Firebase Auth UID of the player",
-          "maxLength": 128
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
         "username": {
           "type": "string",
           "description": "Display name of the pen fight player",
+          "minLength": 1,
           "maxLength": 64
         },
         "email": {
           "type": "string",
-          "description": "Email address of the player",
+          "description": "Private verified email address of the player (owner/admin only)",
+          "minLength": 3,
           "maxLength": 256
         },
         "level": {
           "type": "number",
-          "description": "Current player level"
+          "description": "Current player level (1 to 100)"
         },
         "xp": {
           "type": "number",
@@ -34,11 +37,11 @@
         },
         "paperclips": {
           "type": "number",
-          "description": "Current balance of earned paperclips"
+          "description": "Current balance of earned paperclips (0 to 999999)"
         },
         "division": {
           "type": "number",
-          "description": "Current competitive division (10 to 1)"
+          "description": "Current competitive division (10 down to 1)"
         },
         "divisionPoints": {
           "type": "number",
@@ -46,7 +49,7 @@
         },
         "totalWins": {
           "type": "number",
-          "description": "Total matches won"
+          "description": "Total ranked/tournament matches won"
         },
         "totalMatches": {
           "type": "number",
@@ -54,7 +57,7 @@
         },
         "winStreak": {
           "type": "number",
-          "description": "Current consecutive win streak"
+          "description": "Current consecutive ranked win streak"
         },
         "equippedPenId": {
           "type": "string",
@@ -73,15 +76,15 @@
         },
         "unlockedPens": {
           "type": "array",
-          "description": "List of unlocked real pen brand IDs"
+          "description": "List of unlocked real pen brand IDs (max 50)"
         },
         "unlockedSkins": {
           "type": "array",
-          "description": "List of unlocked geometry box skin IDs"
+          "description": "List of unlocked geometry box skin IDs (max 100)"
         },
         "unlockedFlickStyles": {
           "type": "array",
-          "description": "List of unlocked flicking style IDs"
+          "description": "List of unlocked flicking style IDs (max 20)"
         },
         "role": {
           "type": "string",
@@ -91,6 +94,20 @@
         "isAdmin": {
           "type": "boolean",
           "description": "Whether the user has developer/admin privileges"
+        },
+        "platform": {
+          "type": "string",
+          "enum": ["mobile", "desktop"],
+          "description": "Player's active device platform"
+        },
+        "crossplaySetting": {
+          "type": "string",
+          "enum": ["CROSSPLAY_ENABLED", "SAME_PLATFORM_ONLY"],
+          "description": "Player's matchmaking crossplay preference"
+        },
+        "tutorialCompleted": {
+          "type": "boolean",
+          "description": "Whether the one-time Academy graduation reward has been claimed"
         },
         "createdAt": {
           "type": "string",
@@ -109,15 +126,90 @@
         "email",
         "level",
         "xp",
+        "xpNextLevel",
         "paperclips",
         "division",
+        "divisionPoints",
+        "totalWins",
+        "totalMatches",
+        "winStreak",
         "equippedPenId",
         "equippedSkinId",
         "equippedFlickStyleId",
         "unlockedPens",
         "unlockedSkins",
         "unlockedFlickStyles",
+        "role",
+        "isAdmin",
+        "platform",
+        "crossplaySetting",
+        "tutorialCompleted",
         "createdAt",
+        "updatedAt"
+      ]
+    },
+    "LeaderboardEntry": {
+      "title": "LeaderboardEntry",
+      "description": "Public, PII-free competitive ranking projection for global human leaderboards",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the ranked player",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "description": "Public display name",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "division": {
+          "type": "number",
+          "description": "Current competitive division (10 down to 1)"
+        },
+        "divisionPoints": {
+          "type": "number",
+          "description": "Current division points (0 to 100)"
+        },
+        "totalWins": {
+          "type": "number",
+          "description": "Total competitive wins"
+        },
+        "totalMatches": {
+          "type": "number",
+          "description": "Total matches played"
+        },
+        "winStreak": {
+          "type": "number",
+          "description": "Current ranked win streak"
+        },
+        "equippedPenId": {
+          "type": "string",
+          "description": "Currently equipped pen ID",
+          "maxLength": 64
+        },
+        "isAdmin": {
+          "type": "boolean",
+          "description": "Verified developer admin badge flag"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last ranking synchronization timestamp"
+        }
+      },
+      "required": [
+        "userId",
+        "username",
+        "division",
+        "divisionPoints",
+        "totalWins",
+        "totalMatches",
+        "winStreak",
+        "equippedPenId",
+        "isAdmin",
         "updatedAt"
       ]
     },
@@ -129,11 +221,13 @@
         "title": {
           "type": "string",
           "description": "Headline of the news post",
+          "minLength": 1,
           "maxLength": 140
         },
         "content": {
           "type": "string",
           "description": "Full announcement body text",
+          "minLength": 1,
           "maxLength": 3000
         },
         "category": {
@@ -148,12 +242,14 @@
         "authorName": {
           "type": "string",
           "description": "Display name of the admin author",
+          "minLength": 1,
           "maxLength": 64
         },
         "authorUid": {
           "type": "string",
           "description": "Firebase Auth UID of the admin author",
-          "maxLength": 128
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
         "createdAt": {
           "type": "string",
@@ -177,13 +273,19 @@
       "schema": {
         "$ref": "#/entities/User"
       },
-      "description": "Stores individual player account profile, paperclip wallet, and pen collection"
+      "description": "Private individual player account profile, paperclip wallet, email, and pen collection (owner and admin read only)"
+    },
+    "/leaderboard/{userId}": {
+      "schema": {
+        "$ref": "#/entities/LeaderboardEntry"
+      },
+      "description": "Public PII-free competitive leaderboard entries atomically synchronized with /users/{userId}"
     },
     "/announcements/{announcementId}": {
       "schema": {
         "$ref": "#/entities/Announcement"
       },
-      "description": "Stores official developer news and announcements"
+      "description": "Official developer news and announcements"
     }
   }
 }
